@@ -17,9 +17,9 @@
 | 6 | 完整 32 層 decoder | ✅ 單層對到底（layer 0 整層 CPU 9.7e-07 / GPU 1.0e-03），layer 31 抽驗 attention |
 | 7 | SigLIP2 + aligner | ✅ 完成，CPU 2.4e-06（bf16 包絡 2.6e-02） |
 | 8 | UNetDown / UNetUp / TimestepEmbedder | ✅ 完成，CPU 4.1e-06（bf16 包絡 4.2e-03） |
-| 9 | conditioning、tokenizer、系統提示詞 | |
+| 9 | conditioning、tokenizer、系統提示詞 | ✅ 完成，遮罩與官方逐一相同（刻意沿用官方 tokenizer） |
 | 10 | 完整前向 | |
-| 11 | 取樣器（flow matching） | |
+| 11 | 取樣器（flow matching） | ✅ 完成，50 步軌跡 1.7e-07 |
 | 12 | 量化 + 實測 | |
 
 ## 踩過的坑
