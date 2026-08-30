@@ -26,7 +26,7 @@ import numpy as np
 
 from .imageio import (TimestepEmbedder, UNetDown, UNetUp, load_timestep_embedder,
                       load_unet_down, load_unet_up)
-from .model import DecoderLayer, TextConfig, load_layer
+from .model import DecoderLayer, TextConfig, load_layer, load_layer_quantized
 from .rope import build_batch_2d_rope, build_attention_mask
 
 
@@ -153,3 +153,65 @@ def _scatter_rows(h: mx.array, idx: mx.array, src: mx.array) -> mx.array:
     K = idx.shape[1]
     return mx.put_along_axis(h, mx.broadcast_to(idx[:, :, None], (idx.shape[0], K, D)),
                              src.astype(h.dtype), axis=1)
+
+
+class QuantizedHunyuan(nn.Module):
+    """從 `tools/convert.py` 產出的目錄載入。整包約 46 GiB，可以整個常駐。"""
+
+    def __init__(self, qdir: str | Path, dtype=mx.bfloat16, layers: Optional[int] = None):
+        super().__init__()
+        qdir = Path(qdir)
+        cfg = json.load(open(qdir / "config.json"))
+        qc = json.load(open(qdir / "quant_config.json"))
+        self.qdir, self.raw_cfg, self.q = qdir, cfg, (qc["bits"], qc["group_size"])
+        self.tc = TextConfig.from_json(cfg)
+        self.hidden = cfg["hidden_size"]
+        self.latent_channels = cfg["vae"]["latent_channels"]
+        self.n_layers = layers or cfg["num_hidden_layers"]
+        self.head_dim = cfg["attention_head_dim"]
+        self.rope_theta = cfg["rope_theta"]
+
+        head = mx.load(str(qdir / "head.safetensors"))
+        # wte 在檔案裡是量化的（省 0.8 GiB 磁碟），但查表用不上量化，
+        # 載入時解一次成 bf16 常駐（1.1 GiB）。
+        self.wte = mx.dequantize(head["model.wte.weight"], head["model.wte.scales"],
+                                 head["model.wte.biases"],
+                                 group_size=self.q[1], bits=self.q[0]).astype(dtype)
+
+        self.time_embed = TimestepEmbedder(self.hidden)
+        self.time_embed_2 = TimestepEmbedder(self.hidden)
+        self.timestep_emb = TimestepEmbedder(self.hidden)
+        ph = cfg.get("patch_embed_hidden_dim", 1024)
+        self.patch_embed = UNetDown(self.latent_channels, self.hidden, ph, self.hidden)
+        self.final_layer = UNetUp(self.hidden, self.hidden, ph, self.latent_channels)
+        load_timestep_embedder(self.time_embed, head, "time_embed.", dtype)
+        load_timestep_embedder(self.time_embed_2, head, "time_embed_2.", dtype)
+        load_timestep_embedder(self.timestep_emb, head, "timestep_emb.", dtype)
+        load_unet_down(self.patch_embed, head, "patch_embed.", dtype)
+        load_unet_up(self.final_layer, head, "final_layer.", dtype)
+
+        self.layers = []
+        for i in range(self.n_layers):
+            lyr = DecoderLayer(self.tc, i, self.q)
+            load_layer_quantized(lyr, mx.load(str(qdir / f"layer_{i:02d}.safetensors")))
+            self.layers.append(lyr)
+        mx.eval(self.parameters())
+
+    def embed_tokens(self, tokens: mx.array) -> mx.array:
+        return self.wte[tokens]
+
+    def __call__(self, tokens, latents, t, image_mask, timestep_index,
+                 cos, sin, mask, token_h, token_w, progress=None):
+        h = self.embed_tokens(tokens)
+        B, S, D = h.shape
+        img_seq, _, _ = self.patch_embed(latents, self.time_embed(t))
+        idx = mx.array(np.where(np.array(image_mask, copy=False))[1].reshape(B, -1))
+        h = _scatter_rows(h, idx, img_seq)
+        if timestep_index is not None:
+            h = _scatter_rows(h, timestep_index, self.timestep_emb(t).reshape(B, -1, D))
+        for i, lyr in enumerate(self.layers):
+            h = lyr(h, cos, sin, mask)
+            if progress is not None:
+                progress(i)
+        img = mx.take_along_axis(h, idx[:, :, None], axis=1)
+        return self.final_layer(img, self.time_embed_2(t), token_h, token_w)
