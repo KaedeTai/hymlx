@@ -1,0 +1,4 @@
+*.safetensors
+__pycache__/
+*.log
+*.png
