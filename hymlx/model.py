@@ -19,6 +19,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .quant import QuantLinear, QuantSwitchMLP
 from .rope import apply_rope
 
 
@@ -54,7 +55,7 @@ class TextConfig:
 
 
 class Attention(nn.Module):
-    def __init__(self, cfg: TextConfig):
+    def __init__(self, cfg: TextConfig, q: Optional[Tuple[int, int]] = None):
         super().__init__()
         self.n_heads = cfg.num_attention_heads
         self.n_kv = cfg.num_key_value_heads
@@ -62,9 +63,13 @@ class Attention(nn.Module):
         self.hd = cfg.attention_head_dim
         self.scale = self.hd ** -0.5
         self.use_qk_norm = cfg.use_qk_norm
-        self.qkv_proj = nn.Linear(cfg.hidden_size, (self.n_heads + 2 * self.n_kv) * self.hd,
-                                  bias=cfg.attention_bias)
-        self.o_proj = nn.Linear(self.n_heads * self.hd, cfg.hidden_size, bias=cfg.attention_bias)
+        if q is None:
+            self.qkv_proj = nn.Linear(cfg.hidden_size, (self.n_heads + 2 * self.n_kv) * self.hd,
+                                      bias=cfg.attention_bias)
+            self.o_proj = nn.Linear(self.n_heads * self.hd, cfg.hidden_size, bias=cfg.attention_bias)
+        else:
+            self.qkv_proj = QuantLinear(*q)
+            self.o_proj = QuantLinear(*q)
         if cfg.use_qk_norm:
             self.query_layernorm = nn.RMSNorm(self.hd, eps=cfg.rms_norm_eps)
             self.key_layernorm = nn.RMSNorm(self.hd, eps=cfg.rms_norm_eps)
@@ -89,10 +94,15 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     """SwiGLU，但 gate 與 up 是同一顆權重的兩半：**前半是 up，後半才是 gate**。"""
 
-    def __init__(self, hidden: int, inter: int, bias: bool = False):
+    def __init__(self, hidden: int, inter: int, bias: bool = False,
+                 q: Optional[Tuple[int, int]] = None):
         super().__init__()
-        self.gate_and_up_proj = nn.Linear(hidden, 2 * inter, bias=bias)
-        self.down_proj = nn.Linear(inter, hidden, bias=bias)
+        if q is None:
+            self.gate_and_up_proj = nn.Linear(hidden, 2 * inter, bias=bias)
+            self.down_proj = nn.Linear(inter, hidden, bias=bias)
+        else:
+            self.gate_and_up_proj = QuantLinear(*q)
+            self.down_proj = QuantLinear(*q)
 
     def __call__(self, x: mx.array) -> mx.array:
         up, gate = mx.split(self.gate_and_up_proj(x), 2, axis=-1)
@@ -123,16 +133,17 @@ class Gate(nn.Module):
 
 
 class MoE(nn.Module):
-    def __init__(self, cfg: TextConfig, layer_idx: int):
+    def __init__(self, cfg: TextConfig, layer_idx: int, q: Optional[Tuple[int, int]] = None):
         super().__init__()
         inter = _per_layer(cfg.moe_intermediate_size, layer_idx)
         self.top_k = _per_layer(cfg.moe_topk, layer_idx)
         self.use_shared = cfg.use_mixed_mlp_moe
         self.gate = Gate(cfg.hidden_size, cfg.num_experts)
-        self.experts = SwitchMLP(cfg.hidden_size, inter, cfg.num_experts)
+        self.experts = SwitchMLP(cfg.hidden_size, inter, cfg.num_experts) if q is None \
+            else QuantSwitchMLP(*q)
         if self.use_shared:
             n_sh = _per_layer(cfg.num_shared_expert, layer_idx)
-            self.shared_mlp = MLP(cfg.hidden_size, inter * n_sh, bias=cfg.mlp_bias)
+            self.shared_mlp = MLP(cfg.hidden_size, inter * n_sh, bias=cfg.mlp_bias, q=q)
 
     def __call__(self, x: mx.array) -> mx.array:
         # 路由永遠在 fp32 算：官方的 wg 就是 fp32，且 softmax 之後還要再除一次。
@@ -147,12 +158,12 @@ class MoE(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg: TextConfig, layer_idx: int):
+    def __init__(self, cfg: TextConfig, layer_idx: int, q: Optional[Tuple[int, int]] = None):
         super().__init__()
-        self.self_attn = Attention(cfg)
+        self.self_attn = Attention(cfg, q)
         dense = cfg.num_experts <= 1 or layer_idx < cfg.moe_layer_num_skipped
-        self.mlp = MLP(cfg.hidden_size, cfg.intermediate_size, bias=cfg.mlp_bias) if dense \
-            else MoE(cfg, layer_idx)
+        self.mlp = MLP(cfg.hidden_size, cfg.intermediate_size, bias=cfg.mlp_bias, q=q) if dense \
+            else MoE(cfg, layer_idx, q)
         self.input_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
@@ -238,4 +249,35 @@ def load_decoder(dec: Decoder, w: Dict[str, np.ndarray], dtype=mx.float32,
         n += 2
     for lyr, i in zip(dec.layers, dec.layer_ids):
         n += load_layer(lyr, w, f"model.layers.{i}.", dec.cfg.num_experts, dtype)
+    return n
+
+
+def load_layer_quantized(layer: DecoderLayer, w: Dict[str, mx.array]) -> int:
+    """從 `tools/convert.py` 產生的 layer_NN.safetensors 載入。鍵名不含層前綴。"""
+    n = 0
+
+    def ql(mod, p):
+        nonlocal n
+        mod.weight = w[p + ".weight"]; mod.scales = w[p + ".scales"]; mod.biases = w[p + ".biases"]
+        n += 3
+
+    a = layer.self_attn
+    ql(a.qkv_proj, "self_attn.qkv_proj")
+    ql(a.o_proj, "self_attn.o_proj")
+    a.query_layernorm.weight = w["self_attn.query_layernorm.weight"]
+    a.key_layernorm.weight = w["self_attn.key_layernorm.weight"]
+    layer.input_layernorm.weight = w["input_layernorm.weight"]
+    layer.post_attention_layernorm.weight = w["post_attention_layernorm.weight"]
+    n += 4
+
+    m = layer.mlp
+    m.gate.wg.weight = w["mlp.gate.wg.weight"].astype(mx.float32); n += 1
+    if m.use_shared:
+        ql(m.shared_mlp.gate_and_up_proj, "mlp.shared_mlp.gate_and_up_proj")
+        ql(m.shared_mlp.down_proj, "mlp.shared_mlp.down_proj")
+    for nm in ("up", "gate", "down"):
+        setattr(m.experts, f"{nm}_w", w[f"mlp.experts.{nm}.weight"])
+        setattr(m.experts, f"{nm}_s", w[f"mlp.experts.{nm}.scales"])
+        setattr(m.experts, f"{nm}_b", w[f"mlp.experts.{nm}.biases"])
+        n += 3
     return n
