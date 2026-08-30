@@ -33,6 +33,7 @@ class VAEConfig:
     ffactor_spatial: int = 16
     ffactor_temporal: int = 4
     upsample_match_channel: bool = True
+    downsample_match_channel: bool = True
     scaling_factor: float = 0.562679178327931
 
 
@@ -224,4 +225,117 @@ def load_decoder(dec: Decoder, w: dict, prefix: str = "vae.decoder.", dtype=mx.f
             conv(lvl["upsample"].conv, f"{P}up.{i}.upsample.conv")
     gn(dec.norm_out, P + "norm_out")
     conv(dec.conv_out, P + "conv_out")
+    return n
+
+
+class DownsampleDCAE(nn.Module):
+    """Pixel-unshuffle plus a mean-pooled shortcut — the mirror of UpsampleDCAE."""
+
+    def __init__(self, cin: int, cout: int, temporal: bool):
+        super().__init__()
+        self.factor = 8 if temporal else 4
+        self.r1 = 2 if temporal else 1
+        self.conv = Conv3d(cin, cout // self.factor, 3, 1)
+        self.group_size = self.factor * cin // cout
+        self.cout = cout
+
+    def _unshuffle(self, x: mx.array) -> mx.array:
+        # torch: "b c (f r1) (h r2) (w r3) -> b (r1 r2 r3 c) f h w"
+        b, t, h, w, c = x.shape
+        r1 = self.r1
+        x = x.reshape(b, t // r1, r1, h // 2, 2, w // 2, 2, c)
+        x = x.transpose(0, 1, 3, 5, 2, 4, 6, 7)          # b f h w r1 r2 r3 c
+        return x.reshape(b, t // r1, h // 2, w // 2, r1 * 4 * c)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        h = self._unshuffle(self.conv(x))
+        short = self._unshuffle(x)
+        b, t, hh, w, c = short.shape
+        short = short.reshape(b, t, hh, w, c // self.group_size, self.group_size).mean(axis=-1)
+        return h + short
+
+
+class Encoder(nn.Module):
+    """Pixels -> latent. Unlike the decoder this takes block_out_channels in the
+    given order, and uses `num_res_blocks` per level rather than +1."""
+
+    def __init__(self, cfg: VAEConfig):
+        super().__init__()
+        import math
+        self.cfg = cfg
+        bo = cfg.block_out_channels
+        block_in = bo[0]
+        self.conv_in = Conv3d(cfg.in_channels, block_in, 3, 1)
+        self.levels: List[dict] = []
+        for i, ch in enumerate(bo):
+            blocks = []
+            for _ in range(cfg.layers_per_block):
+                blocks.append(ResnetBlock(block_in, ch))
+                block_in = ch
+            down = None
+            spatial = i < math.log2(cfg.ffactor_spatial)
+            temporal = spatial and i >= math.log2(cfg.ffactor_spatial // cfg.ffactor_temporal)
+            if spatial or temporal:
+                cout = bo[i + 1] if cfg.downsample_match_channel else block_in
+                down = DownsampleDCAE(block_in, cout, temporal)
+                block_in = cout
+            self.levels.append({"block": blocks, "downsample": down})
+        self.mid_block_1 = ResnetBlock(block_in, block_in)
+        self.mid_attn_1 = AttnBlock(block_in)
+        self.mid_block_2 = ResnetBlock(block_in, block_in)
+        self.norm_out = GroupNorm3d(block_in)
+        self.conv_out = Conv3d(block_in, 2 * cfg.latent_channels, 3, 1)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = x.transpose(0, 2, 3, 4, 1)
+        h = self.conv_in(x)
+        for lvl in self.levels:
+            for blk in lvl["block"]:
+                h = blk(h)
+            if lvl["downsample"] is not None:
+                h = lvl["downsample"](h)
+        h = self.mid_block_2(self.mid_attn_1(self.mid_block_1(h)))
+        # mirror of the decoder's repeat_interleave shortcut: mean-pool groups of
+        # channels down to 2 * latent_channels and add it to conv_out.
+        gs = self.cfg.block_out_channels[-1] // (2 * self.cfg.latent_channels)
+        b, t, hh, ww, c = h.shape
+        short = h.reshape(b, t, hh, ww, c // gs, gs).mean(axis=-1)
+        h = self.conv_out(swish(self.norm_out(h))) + short
+        return h.transpose(0, 4, 1, 2, 3)
+
+
+def load_encoder(enc: Encoder, w: dict, prefix: str = "vae.encoder.", dtype=mx.float32) -> int:
+    n = 0
+
+    def conv(mod, p):
+        nonlocal n
+        mod.weight = mx.array(w[p + ".weight"]).transpose(0, 2, 3, 4, 1).astype(dtype)
+        mod.bias = mx.array(w[p + ".bias"]).astype(dtype); n += 2
+
+    def gn(mod, p):
+        nonlocal n
+        mod.weight = mx.array(w[p + ".weight"]).astype(dtype)
+        mod.bias = mx.array(w[p + ".bias"]).astype(dtype); n += 2
+
+    def resnet(mod, p):
+        gn(mod.norm1, p + ".norm1"); conv(mod.conv1, p + ".conv1")
+        gn(mod.norm2, p + ".norm2"); conv(mod.conv2, p + ".conv2")
+        if mod.cin != mod.cout:
+            conv(mod.nin_shortcut, p + ".nin_shortcut")
+
+    P = prefix
+    conv(enc.conv_in, P + "conv_in")
+    for i, lvl in enumerate(enc.levels):
+        for j, blk in enumerate(lvl["block"]):
+            resnet(blk, f"{P}down.{i}.block.{j}")
+        if lvl["downsample"] is not None:
+            conv(lvl["downsample"].conv, f"{P}down.{i}.downsample.conv")
+    resnet(enc.mid_block_1, P + "mid.block_1")
+    a = enc.mid_attn_1
+    gn(a.norm, P + "mid.attn_1.norm")
+    for nm, m in (("q", a.q), ("k", a.k), ("v", a.v), ("proj_out", a.proj_out)):
+        conv(m, f"{P}mid.attn_1.{nm}")
+    resnet(enc.mid_block_2, P + "mid.block_2")
+    gn(enc.norm_out, P + "norm_out")
+    conv(enc.conv_out, P + "conv_out")
     return n
