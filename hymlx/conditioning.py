@@ -91,7 +91,7 @@ class Conditioner:
         self.raw_config = json.load(open(study / "config.json"))
         self.config = HunyuanImage3Config(**self.raw_config)
         self.image_processor = HunyuanImage3ImageProcessor(self.config)
-        self._tokenizer = HunyuanImage3TokenizerFast.from_pretrained(self.snapshot)
+        self._tokenizer = self._load_tokenizer(HunyuanImage3TokenizerFast)
         self.generation_config = GenerationConfig.from_pretrained(self.snapshot)
         self._cls = HunyuanImage3ForCausalMM
         # 借用純邏輯的方法：它們只碰 config / tokenizer / image_processor，
@@ -103,6 +103,31 @@ class Conditioner:
                 setattr(self, name, fn.__get__(self, Conditioner)
                         if not isinstance(inspect.getattr_static(HunyuanImage3ForCausalMM, name),
                                           staticmethod) else fn)
+
+    def _load_tokenizer(self, cls):
+        """`from_pretrained` 在 transformers 5.x 會把 tokenizer.json 的 BPE merges 與
+        ByteLevel pre-tokenizer 丟掉，變成**逐字元**分詞，中文更是整段消失。
+
+        壞掉的樣子不會報錯，只會讓序列變長四倍、語意全毀：
+            from_pretrained:  'a photo of ...' -> 34 個 token ['a','p','h','o','t','o',...]
+            正確的:            'a photo of ...' -> 11 個 token ['a','Ġphoto','Ġof',...]
+        它害我把生成失敗誤判成量化問題查了好幾輪。所以這裡直接用 `tokenizers`
+        自己讀檔，再把它塞進包裝類別，並且當場驗一次。
+        """
+        import json as _json
+        from tokenizers import Tokenizer as _RawTok
+        raw = _RawTok.from_file(f"{self.snapshot}/tokenizer.json")
+        cfg = _json.load(open(f"{self.snapshot}/tokenizer_config.json"))
+        for k in ("tokenizer_class", "auto_map", "added_tokens_decoder"):
+            cfg.pop(k, None)
+        tk = cls(tokenizer_object=raw, **cfg)
+        probe = "a photo of a red fox in snow, natural light"
+        ids = tk.encode(probe, add_special_tokens=False)
+        if len(ids) > 20 or tk.decode(ids) != probe:
+            raise RuntimeError(
+                f"分詞器壞了：{len(probe)} 個字元編成 {len(ids)} 個 token"
+                f"（應該是 11 個）。BPE merges 或 pre-tokenizer 沒載進來。")
+        return tk
 
     # -- 借來的方法 ---------------------------------------------------------
     def _preprocess(self, **kw):
@@ -143,6 +168,13 @@ class Conditioner:
             image_height=gi.image_height, image_width=gi.image_width,
             raw=o,
         )
+
+    def build_text(self, prompt: str, system_prompt=None, bot_task: str = "think", **kw):
+        """gen_text 模式的序列（產生 think / recaption 用）。回傳 (tokens, stop_ids)。"""
+        out = self._preprocess(prompt=prompt, mode="gen_text", system_prompt=system_prompt,
+                               cfg_factor=1, bot_task=bot_task, **kw)
+        o = out["output"]
+        return o.tokens.numpy().astype(np.int32), out["stop_token_id"]
 
     def reference_attention_mask(self, c: Conditioning) -> np.ndarray:
         """官方 `_prepare_attention_mask_for_generation` 的結果，用來對答案。"""

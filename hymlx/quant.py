@@ -66,6 +66,25 @@ class QuantLinear(nn.Module):
         return y if self.bias is None else y + self.bias
 
 
+def gather_sort(x: mx.array, indices: mx.array):
+    """把 (token, 專家) 配對照專家編號排好。
+
+    不排的話 `gather_qmm` 會為每一個配對獨立做一次矩陣向量乘，每次都要把那顆專家
+    21 MB 的權重整包讀一遍——4096 個 token x 8 顆 = 33k 次，700 GB 的讀取量。
+    排好之後同一顆專家的 token 連在一起，變成一次真正的 GEMM。
+    實測：一步 106 s -> 見 notes/plan.md。
+    """
+    M = indices.shape[-1]
+    flat = indices.flatten()
+    order = mx.argsort(flat)
+    inv = mx.argsort(order)
+    return x.flatten(0, -3)[order // M], flat[order], inv
+
+
+def scatter_unsort(x: mx.array, inv: mx.array, shape) -> mx.array:
+    return mx.unflatten(x[inv], 0, shape)
+
+
 class QuantSwitchMLP(nn.Module):
     """64 顆專家的量化版。每顆專家自己一組 scale/bias。"""
 
@@ -77,16 +96,24 @@ class QuantSwitchMLP(nn.Module):
             setattr(self, f"{n}_s", mx.zeros((1, 1, 1)))
             setattr(self, f"{n}_b", mx.zeros((1, 1, 1)))
 
-    def _mm(self, x: mx.array, n: str, inds: mx.array) -> mx.array:
+    def _mm(self, x: mx.array, n: str, inds: mx.array, sorted_: bool) -> mx.array:
         return mx.gather_qmm(x, getattr(self, f"{n}_w"), scales=getattr(self, f"{n}_s"),
                              biases=getattr(self, f"{n}_b"), rhs_indices=inds,
-                             transpose=True, group_size=self.group_size, bits=self.bits)
+                             transpose=True, group_size=self.group_size, bits=self.bits,
+                             sorted_indices=sorted_)
 
     def __call__(self, x: mx.array, inds: mx.array) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
-        up = self._mm(x, "up", inds)
-        gate = self._mm(x, "gate", inds)
-        return self._mm(up * nn.silu(gate), "down", inds).squeeze(-2)
+        do_sort = inds.size >= 64
+        idx, inv = inds, None
+        if do_sort:
+            x, idx, inv = gather_sort(x, inds)
+        up = self._mm(x, "up", idx, do_sort)
+        gate = self._mm(x, "gate", idx, do_sort)
+        y = self._mm(up * nn.silu(gate), "down", idx, do_sort)
+        if do_sort:
+            y = scatter_unsort(y, inv, inds.shape)
+        return y.squeeze(-2)
 
 
 def quantize_stack(w: mx.array, bits: int, group_size: int) -> Tuple[mx.array, mx.array, mx.array]:

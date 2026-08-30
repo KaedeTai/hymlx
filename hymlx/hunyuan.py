@@ -190,6 +190,15 @@ class QuantizedHunyuan(nn.Module):
         load_unet_down(self.patch_embed, head, "patch_embed.", dtype)
         load_unet_up(self.final_layer, head, "final_layer.", dtype)
 
+        import mlx.nn as _nn
+        from .quant import QuantLinear as _QL
+        self.ln_f = _nn.RMSNorm(self.hidden, eps=cfg["rms_norm_eps"])
+        self.ln_f.weight = head["model.ln_f.weight"].astype(dtype)
+        self.lm_head = _QL(*self.q)
+        self.lm_head.weight = head["lm_head.weight"]
+        self.lm_head.scales = head["lm_head.scales"]
+        self.lm_head.biases = head["lm_head.biases"]
+
         self.layers = []
         for i in range(self.n_layers):
             lyr = DecoderLayer(self.tc, i, self.q)
@@ -199,6 +208,21 @@ class QuantizedHunyuan(nn.Module):
 
     def embed_tokens(self, tokens: mx.array) -> mx.array:
         return self.wte[tokens]
+
+    def logits(self, tokens: mx.array, cos: mx.array, sin: mx.array,
+               mask=None, caches=None) -> mx.array:
+        """純文字模式：走 ln_f + lm_head。影像模式**不走** ln_f，這是兩條不同的路。
+
+        caches 是 32 個 [k, v]；給了就是增量解碼，只餵新的 token。
+        """
+        h = self.embed_tokens(tokens)
+        for i, lyr in enumerate(self.layers):
+            h = lyr(h, cos, sin, mask, None if caches is None else caches[i])
+        h = self.ln_f(h[:, -1:, :])
+        return self.lm_head(h)[:, 0]
+
+    def new_caches(self):
+        return [[] for _ in range(self.n_layers)]
 
     def __call__(self, tokens, latents, t, image_mask, timestep_index,
                  cos, sin, mask, token_h, token_w, progress=None):

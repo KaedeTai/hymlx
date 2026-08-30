@@ -24,7 +24,7 @@ def main() -> int:
     from hymlx.hunyuan import QuantizedHunyuan
     from hymlx.rope import build_batch_2d_rope, build_attention_mask
     from hymlx.sampling import cfg as apply_cfg, sigma_schedule
-    from hymlx.vae import Decoder, VAEConfig, load_decoder
+    from hymlx.vae import Decoder, VAEConfig, decode_image, load_decoder
 
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt")
@@ -36,11 +36,25 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--model", default=str(Path.home() / "models/hymlx-4bit"))
     ap.add_argument("--layers", type=int, default=None, help="只跑前 N 層（測速用）")
+    ap.add_argument("--system-prompt", default="en_vanilla",
+                    help="en_vanilla / en_unified / none")
+    ap.add_argument("--cot-file", default=None,
+                    help="tools/recaption.py 產生的 <think>…</think><recaption>…</recaption>")
+    ap.add_argument("--recaption", default=None,
+                    help="官方的圖像階段一定會餵一段 recaption（think/recaption 產生的）。"
+                         "沒有它模型是在分布外跑。這裡先讓人手動給。")
     a = ap.parse_args()
 
     t0 = time.time()
     cond = Conditioner()
-    c = cond.build(a.prompt, image_size=a.size)
+    sp = None if a.system_prompt == "none" else cond.system_prompt(a.system_prompt)
+    cot = None
+    tk = cond._tokenizer
+    if a.cot_file:
+        cot = [Path(a.cot_file).read_text()]
+    elif a.recaption:
+        cot = [tk.recaption_token + a.recaption + tk.end_of_recaption_token]
+    c = cond.build(a.prompt, image_size=a.size, system_prompt=sp, cot_text=cot)
     print(f"序列 {c.tokens.shape}  影像 token {c.token_h}x{c.token_w}  "
           f"輸出 {c.image_width}x{c.image_height}  ({time.time()-t0:.1f}s)")
 
@@ -90,8 +104,8 @@ def main() -> int:
         "upsample_match_channel", "downsample_match_channel", "scaling_factor")}))
     load_decoder(dec, mx.load(str(Path(a.model) / "vae.safetensors")))
     mx.eval(dec.parameters())
-    img = dec(lat[:, :, None, :, :])                # (B, C, T, H, W)
-    img = np.array(img, copy=False)[0, :, 0]
+    # 一定要走 decode_image：T=1 的 latent 會放大成 4 幀，官方取的是最後一幀
+    img = np.array(decode_image(dec, lat), copy=False)[0, :, -1]
     img = np.clip((img + 1) / 2, 0, 1)
     from PIL import Image
     Image.fromarray((img.transpose(1, 2, 0) * 255).round().astype(np.uint8)).save(a.out)

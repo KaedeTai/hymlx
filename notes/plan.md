@@ -20,7 +20,7 @@
 | 9 | conditioning、tokenizer、系統提示詞 | ✅ 完成，遮罩與官方逐一相同（刻意沿用官方 tokenizer） |
 | 10 | 完整前向 | ✅ streaming 對照 32 層，單層誤差最差 1.035e-06 |
 | 11 | 取樣器（flow matching） | ✅ 完成，50 步軌跡 1.7e-07 |
-| 12 | 量化 + 實測 | 4-bit 轉檔完成，單層誤差是 bf16 本底的 4.7 倍 |
+| 12 | 量化 + 實測 | 8-bit 可用；**4-bit 不能用**，理由見下 |
 
 ## 踩過的坑
 
@@ -43,6 +43,34 @@
 - **torch 在 CPU 上沒有 bf16 的 conv3d 核心**，量包絡要在 MPS 上跑，不然會卡死。
 - 官方的 `Conv3d` 子類只是記憶體優化（>2 GiB 時沿時間軸切塊），註解自己寫數值差異
   在 1e-5 內。不要複製那套切塊，用普通卷積就好。
+
+## 生成一直畫不對，查出來的三個原因
+
+按嚴重程度排，第一個是根因：
+
+1. **分詞器被 transformers 5.x 悄悄弄壞成逐字元。**
+   `HunyuanImage3TokenizerFast.from_pretrained()` 載進來的 backend 少了 BPE merges
+   與 ByteLevel pre-tokenizer，於是 `'a photo of ...'`（43 字元）被編成 **34 個
+   單字元 token**（正確是 11 個），中文則整段消失、編出 0 個 token。
+   它不報錯，只是讓模型讀到一串字元湯。這害我把「圖畫不對」誤判成量化問題查了好幾輪。
+   修法：用 `tokenizers.Tokenizer.from_file()` 自己讀 tokenizer.json，再
+   `cls(tokenizer_object=raw, **config)`，並在載入時當場驗一次（見 `conditioning.py`）。
+
+2. **4-bit 在高噪聲端把訊號整個蓋掉。** 同一組輸入比 4-bit 與 bf16 對乾淨 latent 的估計：
+   sigma=0.5 相關 **+0.9863**，sigma=1.0 相關 **+0.0259**——完全不相關。
+   高噪聲端模型要決定「要畫什麼」，那個訊號小而細，4-bit 的量化雜訊直接蓋掉它，
+   軌跡從隨機方向出發。改用 8-bit（8.5 bit/參數，84 GiB）就有照片級的結構。
+   **低噪聲端 4-bit 完全夠用**：從 sigma=0.6 的真 latent 走回去，兩張臉結構完整。
+
+3. **VAE 解碼取錯幀。** T=1 的 latent 解出來是 4 幀，官方
+   `AutoencoderKLConv3D.decode` 取的是**最後一幀**（`decoded[:, :, -1:]`）。
+   那一行在 wrapper 裡不在 `Decoder` 模組裡，所以模組級的逐張量比對抓不到。
+   取第一幀的圖看起來像模型壞掉：16 px 的格子、沒有內容。
+   `tests/test_vae_roundtrip.py` 現在把它釘住（PSNR 20.1 dB vs 取錯幀的 13.9 dB）。
+
+**方法上的教訓**：模組逐張量對得上不代表整條路是對的。這三個錯全部落在模組之間的
+接縫——wrapper 的一行、外部函式庫的行為、精度的選擇。端到端的來回測試（VAE 來回、
+讓模型吐一段英文）比再多的模組級比對都便宜也都有效。
 
 ## 已知的事實
 

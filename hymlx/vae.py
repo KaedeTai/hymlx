@@ -188,6 +188,20 @@ class Decoder(nn.Module):
         return h.transpose(0, 4, 1, 2, 3)                 # -> NCTHW
 
 
+def decode_image(dec: "Decoder", z: mx.array) -> mx.array:
+    """靜態圖的解碼入口。**一定要走這一顆，不要直接呼叫 Decoder。**
+
+    T=1 的 latent 會被時間軸放大成 4 幀，官方 `AutoencoderKLConv3D.decode` 取的是
+    **最後一幀**（`decoded[:, :, -1:]`），不是第一幀。取錯幀的圖看起來像是模型壞了：
+    16 px 的格子、沒有內容——而 Decoder 模組本身逐張量比對是對的，所以這個錯不會被
+    模組層級的測試抓到。
+    """
+    if z.ndim == 4:
+        z = z[:, :, None]
+    out = dec(z)
+    return out[:, :, -1:] if z.shape[2] == 1 else out
+
+
 def load_decoder(dec: Decoder, w: dict, prefix: str = "vae.decoder.", dtype=mx.float32) -> int:
     """torch (out, in, kD, kH, kW) -> MLX (out, kD, kH, kW, in)."""
     n = 0

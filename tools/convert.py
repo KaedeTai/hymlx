@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import json
 import shutil
 import time
@@ -51,6 +52,10 @@ def main() -> int:
     ap.add_argument("--group-size", type=int, default=64)
     ap.add_argument("--out", type=str, default=str(Path.home() / "models/hymlx-4bit"))
     ap.add_argument("--layers", type=str, default=None, help="例如 0-3，只轉部分層（除錯用）")
+    ap.add_argument("--prune-source", action="store_true",
+                    help="轉完一層之後，把已經沒有人要用的原始 shard 刪掉。"
+                         "磁碟塞不下 157 GiB 原檔加上輸出時用。任何一刻資料不是在原檔"
+                         "就是在新檔，不會兩頭空。")
     a = ap.parse_args()
 
     study = Path.home() / "repos/hunyuan-study"
@@ -71,6 +76,40 @@ def main() -> int:
 
     total_bytes = 0
     t_all = time.time()
+
+    def free_disk_gib():
+        st = os.statvfs(out)
+        return st.f_bavail * st.f_frsize / 2 ** 30
+
+    def prune(done_upto: int):
+        """刪掉只服務 layer <= done_upto 的 shard。"""
+        if not a.prune_source:
+            return
+        still_needed = set()
+        for name, sh in index["weight_map"].items():
+            top = name.split(".")[0]
+            if top in ("vae", "vision_model", "vision_aligner", "patch_embed", "final_layer",
+                       "time_embed", "time_embed_2", "timestep_emb", "lm_head") or name.startswith("model.wte") \
+                    or name == "model.ln_f.weight":
+                continue
+            if name.startswith("model.layers."):
+                li = int(name.split(".")[2])
+                if li > done_upto:
+                    still_needed.add(sh)
+        freed = 0
+        for sh in sorted(set(index["weight_map"].values())):
+            if sh in still_needed:
+                continue
+            f = Path(snap) / sh
+            if f.exists():
+                real = f.resolve()
+                sz = real.stat().st_size
+                real.unlink(missing_ok=True)
+                f.unlink(missing_ok=True)
+                freed += sz
+        if freed:
+            print(f"    刪掉已用完的原始 shard {freed / 2**30:.1f} GiB，"
+                  f"剩餘磁碟 {free_disk_gib():.0f} GiB", flush=True)
 
     # --- 頭尾：全部保持 bf16，這幾層是像素與 token 的介面，不能量 ---
     head = {}
@@ -133,9 +172,11 @@ def main() -> int:
         f = out / f"layer_{i:02d}.safetensors"
         mx.save_safetensors(str(f), d)
         sz = f.stat().st_size; total_bytes += sz
-        print(f"  layer {i:>2}: {len(d)} 個張量 {sz / 2**30:.2f} GiB  {time.time()-t0:.0f}s")
+        print(f"  layer {i:>2}: {len(d)} 個張量 {sz / 2**30:.2f} GiB  {time.time()-t0:.0f}s"
+              f"  磁碟剩 {free_disk_gib():.0f} GiB", flush=True)
         del d
         r.close()
+        prune(i)
 
     meta = dict(bits=bits, group_size=gs, source="tencent/HunyuanImage-3.0-Instruct",
                 num_hidden_layers=NL, num_experts=NE,

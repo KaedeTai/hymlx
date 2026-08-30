@@ -19,7 +19,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .quant import QuantLinear, QuantSwitchMLP
+from .quant import QuantLinear, QuantSwitchMLP, gather_sort, scatter_unsort
 from .rope import apply_rope
 
 
@@ -75,7 +75,9 @@ class Attention(nn.Module):
             self.key_layernorm = nn.RMSNorm(self.hd, eps=cfg.rms_norm_eps)
 
     def __call__(self, x: mx.array, cos: mx.array, sin: mx.array,
-                 mask: Optional[mx.array] = None) -> mx.array:
+                 mask: Optional[mx.array] = None, cache: Optional[list] = None) -> mx.array:
+        """cache 是 [k, v]（原地更新）。只有純文字的逐字生成會用到；
+        影像那條路每一步都重算整條序列，不走 cache。"""
         B, S, _ = x.shape
         g, hd = self.groups, self.hd
         qkv = self.qkv_proj(x).reshape(B, S, self.n_kv, g + 2, hd)
@@ -86,6 +88,11 @@ class Attention(nn.Module):
         if self.use_qk_norm:
             q = self.query_layernorm(q)
             k = self.key_layernorm(k)
+        if cache is not None:
+            if cache:
+                k = mx.concatenate([cache[0], k], axis=2)
+                v = mx.concatenate([cache[1], v], axis=2)
+            cache[:] = [k, v]
         o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         o = o.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * hd)
         return self.o_proj(o)
@@ -120,9 +127,18 @@ class SwitchMLP(nn.Module):
 
     def __call__(self, x: mx.array, inds: mx.array) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))                       # (B, S, 1, 1, D)
-        up = mx.gather_mm(x, self.up_w.swapaxes(-1, -2), rhs_indices=inds)
-        gate = mx.gather_mm(x, self.gate_w.swapaxes(-1, -2), rhs_indices=inds)
-        y = mx.gather_mm(up * nn.silu(gate), self.down_w.swapaxes(-1, -2), rhs_indices=inds)
+        do_sort = inds.size >= 64                             # 理由見 quant.gather_sort
+        idx, inv = inds, None
+        if do_sort:
+            x, idx, inv = gather_sort(x, inds)
+
+        def mm(a, w):
+            return mx.gather_mm(a, w.swapaxes(-1, -2), rhs_indices=idx,
+                                sorted_indices=do_sort)
+
+        y = mm(mm(x, self.up_w) * nn.silu(mm(x, self.gate_w)), self.down_w)
+        if do_sort:
+            y = scatter_unsort(y, inv, inds.shape)
         return y.squeeze(-2)                                  # (B, S, k, D)
 
 
@@ -167,8 +183,8 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def __call__(self, x, cos, sin, mask=None):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, mask)
+    def __call__(self, x, cos, sin, mask=None, cache=None):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, mask, cache)
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
