@@ -13,10 +13,10 @@
 | 2 | 單層 MoE 對照 | ✅ 完成，CPU 3.622e-07（補上 `norm_topk_prob` 之後） |
 | 3 | VAE 解碼器（latent → 像素） | ✅ 完成，CPU 3.692e-04（bf16 包絡的 3%） |
 | 4 | VAE 編碼器（參考圖用） | ✅ 完成，CPU 7.018e-06 / GPU 2.406e-05（bf16 包絡 8.29e-3） |
-| 5 | 2D 圖像 RoPE + 非因果注意力遮罩 | |
+| 5 | 2D 圖像 RoPE + 非因果注意力遮罩 | ✅ 完成，逐一相同 / 5.96e-08 |
 | 6 | 完整 32 層 decoder | |
 | 7 | SigLIP2 + aligner | |
-| 8 | UNetDown / UNetUp / TimestepEmbedder | |
+| 8 | UNetDown / UNetUp / TimestepEmbedder | ✅ 完成，CPU 4.1e-06（bf16 包絡 4.2e-03） |
 | 9 | conditioning、tokenizer、系統提示詞 | |
 | 10 | 完整前向 | |
 | 11 | 取樣器（flow matching） | |
