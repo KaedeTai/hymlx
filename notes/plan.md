@@ -14,8 +14,8 @@
 | 3 | VAE 解碼器（latent → 像素） | ✅ 完成，CPU 3.692e-04（bf16 包絡的 3%） |
 | 4 | VAE 編碼器（參考圖用） | ✅ 完成，CPU 7.018e-06 / GPU 2.406e-05（bf16 包絡 8.29e-3） |
 | 5 | 2D 圖像 RoPE + 非因果注意力遮罩 | ✅ 完成，逐一相同 / 5.96e-08 |
-| 6 | 完整 32 層 decoder | |
-| 7 | SigLIP2 + aligner | |
+| 6 | 完整 32 層 decoder | ✅ 單層對到底（layer 0 整層 CPU 9.7e-07 / GPU 1.0e-03），layer 31 抽驗 attention |
+| 7 | SigLIP2 + aligner | ✅ 完成，CPU 2.4e-06（bf16 包絡 2.6e-02） |
 | 8 | UNetDown / UNetUp / TimestepEmbedder | ✅ 完成，CPU 4.1e-06（bf16 包絡 4.2e-03） |
 | 9 | conditioning、tokenizer、系統提示詞 | |
 | 10 | 完整前向 | |
