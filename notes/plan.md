@@ -81,3 +81,25 @@
 - 圖像 token 數 = (H/16) × (W/16)，`patch_size=1`。1024² → 4096 token。
 - 速度是**計算受限**不是頻寬受限：1024² 一次前向計算 2.8 s、讀權重 0.08 s。
   量化讓它放得進 128 GB，不會讓它變快。
+
+## 現在的狀態（原始權重已刪之後）
+
+原始 157 GiB 的 bf16 權重已經刪掉，換成 `~/models/hymlx-8bit`（84 GiB）。
+因此**需要原始權重當對照組的測試現在跑不了**：
+`test_vae_decoder` / `test_vae_encoder` / `test_decoder_layer` / `test_imageio` /
+`test_vision` / `test_full_forward` / `test_quant`。它們的結果留在這份文件的表裡。
+還能跑的是不需要對照組的四支：`test_rope`、`test_sampler`、`test_conditioning`、
+`test_vae_roundtrip`。要重跑前面那七支，得重新下載官方權重（約 25 分鐘）。
+
+實測（M5 Max 128 GB，8-bit，1024x1024，CFG 所以每步兩個 batch）：
+
+| 階段 | 時間 |
+|---|---|
+| think + recaption（1100 token，有 KV cache） | 約 100 s |
+| 取樣 50 步（序列 6278 token） | 1006 s（20.1 s/步） |
+| 取樣 30 步（序列 4719 token） | 387 s（12.9 s/步） |
+| 模型載入 | 7 s |
+
+沒有做 KV cache 的是**影像**那條路：每一步都重算整條序列。官方靠 cache 省下文字前綴，
+但這裡文字只佔 6278 個 token 中的約 2200，而且影像那 4096 個 token 每一步都要重算，
+省下來的不到三分之一。要再快就得先做影像路徑的 cache。
