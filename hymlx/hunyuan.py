@@ -164,6 +164,7 @@ class QuantizedHunyuan(nn.Module):
         cfg = json.load(open(qdir / "config.json"))
         qc = json.load(open(qdir / "quant_config.json"))
         self.qdir, self.raw_cfg, self.q = qdir, cfg, (qc["bits"], qc["group_size"])
+        self.wdtype = dtype
         self.tc = TextConfig.from_json(cfg)
         self.hidden = cfg["hidden_size"]
         self.latent_channels = cfg["vae"]["latent_channels"]
@@ -199,6 +200,7 @@ class QuantizedHunyuan(nn.Module):
         self.lm_head.scales = head["lm_head.scales"]
         self.lm_head.biases = head["lm_head.biases"]
 
+        self._vision = self._aligner = self._encoder = None   # 編輯才載
         self.layers = []
         for i in range(self.n_layers):
             lyr = DecoderLayer(self.tc, i, self.q)
@@ -235,11 +237,74 @@ class QuantizedHunyuan(nn.Module):
     # 序列尾巴 <eoi> 之後的文字也不用算，final_layer 根本不讀它們。
     # ------------------------------------------------------------------
 
-    def prefill_prefix(self, tokens: mx.array, cos: mx.array, sin: mx.array,
-                       mask: mx.array):
-        """把 <timestep> 之前的整段文字跑一次，留下每一層的 k/v。只做一次。"""
-        caches = self.new_caches()
+    # -- 參考圖（編輯用）------------------------------------------------
+    # 參考圖的 token 在取樣過程中不變（時間步固定 0，就是「乾淨的圖」），
+    # 而且在序列上排在生成影像之前，所以整段可以放進前綴快取：每步成本不變，
+    # 只有一次性的前綴變長。
+
+    def _load_cond_encoders(self):
+        """視覺塔與 VAE 編碼器只有編輯才用得到，用到才載（約 2.2 GiB）。"""
+        if getattr(self, "_vision", None) is not None:
+            return
+        import json as _json
+        from .vae import Encoder, VAEConfig, load_encoder
+        from .vision import Aligner, VisionConfig, VisionTower, load_aligner, load_vision
+        cfg = self.raw_cfg
+        vw = mx.load(str(self.qdir / "vision.safetensors"))
+        self._vision = VisionTower(VisionConfig.from_json(cfg["vit"]))
+        load_vision(self._vision, vw, dtype=self.wdtype)
+        al = cfg["vit_aligner"]
+        self._aligner = Aligner(**{k: al[k] for k in ("input_dim", "n_embed", "depth")})
+        load_aligner(self._aligner, vw, dtype=self.wdtype)
+        vc = cfg["vae"]
+        K = ("in_channels", "out_channels", "latent_channels", "block_out_channels",
+             "layers_per_block", "ffactor_spatial", "ffactor_temporal",
+             "upsample_match_channel", "downsample_match_channel", "scaling_factor")
+        self._vae_cfg = VAEConfig(**{k: vc[k] for k in K})
+        self._encoder = Encoder(self._vae_cfg)
+        load_encoder(self._encoder, mx.load(str(self.qdir / "vae.safetensors")))
+        mx.eval(self._vision.parameters(), self._aligner.parameters(),
+                self._encoder.parameters())
+
+    def encode_cond_image(self, pixels: mx.array) -> mx.array:
+        """(B, 3, H, W) 的 [-1,1] 像素 -> (B, 32, h, w) 的 latent。
+
+        官方對靜態圖是沿時間軸 expand 成 4 幀再編碼，取的是後驗的平均
+        （logvar 平均 -14.5，標準差約 7e-4，取樣與取平均沒有差別）。
+        """
+        self._load_cond_encoders()
+        x = mx.repeat(pixels[:, :, None], self._vae_cfg.ffactor_temporal, axis=2)
+        z = self._encoder(x)[:, :self._vae_cfg.latent_channels, 0]
+        return z * self._vae_cfg.scaling_factor
+
+    def embed_prefix(self, tokens: mx.array, cond=None) -> mx.array:
+        """前綴的 embedding。有參考圖就把 VAE latent 與 ViT 特徵蓋進去。"""
         h = self.embed_tokens(tokens)
+        if cond is None:
+            return h
+        self._load_cond_encoders()
+        B, S, D = h.shape
+        t0 = mx.zeros((B,))
+        lat = self.encode_cond_image(mx.array(cond.vae_pixels))
+        img, _, _ = self.patch_embed(lat, self.time_embed(t0))
+        h = _scatter_rows(h, mx.array(cond.vae_index), img)
+        feat = self._aligner(self._vision(mx.array(cond.vit_pixels), cond.vit_shapes,
+                                          mx.array(cond.vit_mask)))
+        h = _scatter_rows(h, mx.array(cond.vit_index), feat)
+        h = _scatter_rows(h, mx.array(cond.ts_index),
+                          self.timestep_emb(t0).reshape(B, -1, D))
+        return h
+
+    def prefill_prefix(self, tokens: mx.array, cos: mx.array, sin: mx.array,
+                       mask: mx.array, cond=None):
+        """把 <timestep> 之前的整段跑一次，留下每一層的 k/v。只做一次。"""
+        caches = self.new_caches()
+        h = self.embed_prefix(tokens, cond)
+        if cond is not None:
+            # 視覺塔與 VAE 編碼器只在這裡用一次。模型本體已經佔 84 GiB，
+            # 編輯的序列又比文生圖長一倍，留著這 2.2 GiB 會把機器推進 swap。
+            self._vision = self._aligner = self._encoder = None
+            mx.clear_cache()
         for i, lyr in enumerate(self.layers):
             h = lyr(h, cos, sin, mask, caches[i])
         mx.eval([a for c in caches for a in c])

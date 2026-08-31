@@ -68,14 +68,14 @@ def generate_cot(m, cond, prompt, sys_prompt, max_new=1100, temperature=0.6,
 
 
 def render(m, cond, dec, vc, prompt, cot, sys_prompt, size, steps, guidance, shift,
-           seed, out_path, cfg_steps=None, log=print):
+           seed, out_path, cfg_steps=None, image=None, model_dir=None, log=print):
     from hymlx.rope import build_batch_2d_rope, build_attention_mask
     from hymlx.sampling import cfg as apply_cfg, sigma_schedule
     from hymlx.vae import decode_image
     from PIL import Image
 
     c = cond.build(prompt, image_size=size, system_prompt=sys_prompt,
-                   cot_text=[cot] if cot else None)
+                   cot_text=[cot] if cot else None, image=image)
     D = m.head_dim
     cos = mx.stack([build_batch_2d_rope(c.seq_len, D, image_infos=[i], base=m.rope_theta)[0][0]
                     for i in c.rope_image_info])
@@ -85,16 +85,20 @@ def render(m, cond, dec, vc, prompt, cot, sys_prompt, size, steps, guidance, shi
     istart = int(np.where(c.gen_image_mask[0])[0][0])
     iend = int(np.where(c.gen_image_mask[0])[0][-1]) + 1
     assert istart == P + 1
-    pm = mx.broadcast_to(build_attention_mask(P)[0], (2, 1, P, P))
+    # 前綴的遮罩：文字因果，但參考圖那一整塊（VAE + ViT）要全連通
+    pre_full = [s_ for s_ in c.full_attn_slices[0] if s_.stop <= P]
+    pm = mx.broadcast_to(build_attention_mask(P, pre_full)[0], (2, 1, P, P))
     pam = mx.where(pm, mx.array(0.0, mx.float32), mx.array(-3.4028235e38, mx.float32))
     t0 = time.time()
     caches = m.prefill_prefix(mx.array(c.tokens[:, :P].astype(np.int32)),
-                              cos[:, :P], sin[:, :P], pam)
+                              cos[:, :P], sin[:, :P], pam, cond=c.cond)
     del pm, pam; mx.clear_cache()
     # 後段不做 CFG 時，只留有條件那一列的 k/v
     caches1 = [[k[0:1], v[0:1]] for k, v in caches]
     kcfg = steps if cfg_steps is None else min(cfg_steps, steps)
-    log(f"    序列 {c.seq_len}，前綴 {P}，預填 {time.time()-t0:.0f}s")
+    log(f"    序列 {c.seq_len}，前綴 {P}"
+        f"{'（含參考圖 %d 個 token）' % (len(c.cond.vae_index[0]) + len(c.cond.vit_index[0])) if c.cond else ''}"
+        f"，預填 {time.time()-t0:.0f}s")
     cos_ts, sin_ts = cos[:, P:P + 1], sin[:, P:P + 1]
     cos_img, sin_img = cos[:, istart:iend], sin[:, istart:iend]
 
@@ -117,6 +121,10 @@ def render(m, cond, dec, vc, prompt, cot, sys_prompt, size, steps, guidance, shi
         mx.eval(x); mx.clear_cache()
     dt = time.time() - t0
     del caches, caches1; mx.clear_cache()
+    if dec is None:
+        from hymlx.vae import Decoder, load_decoder
+        dec = Decoder(vc); load_decoder(dec, mx.load(str(model_dir / "vae.safetensors")))
+        mx.eval(dec.parameters())
     img = np.array(decode_image(dec, x / vc.scaling_factor), copy=False)[0, :, -1]
     img = np.clip((img + 1) / 2, 0, 1).transpose(1, 2, 0)
     Image.fromarray((img * 255).round().astype(np.uint8)).save(out_path)
@@ -143,6 +151,8 @@ def main() -> int:
     ap.add_argument("--system-prompt", default="en_unified")
     ap.add_argument("--no-cot", action="store_true")
     ap.add_argument("--cot-file", default=None, help="重用先前產生的 CoT，省掉文字階段")
+    ap.add_argument("--image", default=None,
+                    help="參考圖（編輯）。同一張圖會同時走 VAE 與 ViT 兩條路。")
     ap.add_argument("--cfg-steps", type=int, default=None,
                     help="只有前 N 步做 CFG，後面用有條件那條就好。"
                          "14 步時給 6 大約省 20%%，圖幾乎一樣。")
@@ -158,8 +168,7 @@ def main() -> int:
          "layers_per_block", "ffactor_spatial", "ffactor_temporal",
          "upsample_match_channel", "downsample_match_channel", "scaling_factor")
     vc = VAEConfig(**{k: vcfg[k] for k in K})
-    dec = Decoder(vc); load_decoder(dec, mx.load(str(Path(a.model) / "vae.safetensors")))
-    mx.eval(dec.parameters())
+    dec = None      # 解碼器最後才用，先不佔記憶體
     sp = None if a.system_prompt == "none" else cond.system_prompt(a.system_prompt,
                                                                    "think_recaption")
     print(f"載入 {time.time()-t0:.0f}s\n")
@@ -169,12 +178,18 @@ def main() -> int:
         t_sub = time.time()
         if a.cot_file:
             cot = Path(a.cot_file).read_text()
+        elif a.image:
+            # 編輯先不走 CoT：文字階段的序列本身也含參考圖，要另外接
+            cot = None
+        elif a.no_cot:
+            cot = None
         else:
-            cot = None if a.no_cot else generate_cot(m, cond, prompt, sp, seed=a.seed)
+            cot = generate_cot(m, cond, prompt, sp, seed=a.seed)
         if cot:
             (outdir / f"{name}_cot.txt").write_text(cot)
         render(m, cond, dec, vc, prompt, cot, sp, a.size, a.steps, a.guidance,
-               a.shift, a.seed, outdir / f"{name}.png", cfg_steps=a.cfg_steps)
+               a.shift, a.seed, outdir / f"{name}.png", cfg_steps=a.cfg_steps,
+               image=a.image, model_dir=Path(a.model))
         print(f"    小計 {time.time()-t_sub:.0f}s\n", flush=True)
     return 0
 

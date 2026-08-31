@@ -45,6 +45,22 @@ def _install_cuda_stubs() -> None:
 
 
 @dataclass
+class CondImages:
+    """參考圖：同一張圖同時走 VAE 與 ViT 兩條路（`cond_image_type = "vae_vit"`）。
+
+    VAE 那條給像素級的細節，ViT 那條給語意。兩段在序列上相鄰，注意力上算同一個
+    區塊（`cond_token_attn_type = "joint_full"`）。時間步固定 0，代表「這是乾淨的圖」。
+    """
+    vae_pixels: np.ndarray          # (B, 3, H, W)，值域 [-1, 1]
+    vae_index: np.ndarray           # (B, 4096) 序列上的位置
+    vit_pixels: np.ndarray          # (B, 1024, 768) 已經 patch 攤平
+    vit_index: np.ndarray           # (B, 1024)
+    vit_shapes: list                # 每一列的 (h, w) patch 格點
+    vit_mask: np.ndarray            # (B, 1024) 哪些 patch 是真的
+    ts_index: np.ndarray            # (B, 1) 參考圖的 timestep token 位置
+
+
+@dataclass
 class Conditioning:
     """一次生成需要的全部序列資訊。slice 都是對 tokens 的索引。"""
     tokens: np.ndarray                      # (B, S) int32
@@ -56,6 +72,7 @@ class Conditioning:
     token_w: int
     image_height: int
     image_width: int
+    cond: Optional["CondImages"] = None     # 參考圖（編輯用）
     raw: Any = None                         # 官方的 TokenizerEncodeOutput，除錯用
 
     @property
@@ -91,6 +108,7 @@ class Conditioner:
         self.raw_config = json.load(open(study / "config.json"))
         self.config = HunyuanImage3Config(**self.raw_config)
         self.image_processor = HunyuanImage3ImageProcessor(self.config)
+        self._patch_vit_processor()
         self._tokenizer = self._load_tokenizer(HunyuanImage3TokenizerFast)
         self.generation_config = GenerationConfig.from_pretrained(self.snapshot)
         self._cls = HunyuanImage3ForCausalMM
@@ -103,6 +121,33 @@ class Conditioner:
                 setattr(self, name, fn.__get__(self, Conditioner)
                         if not isinstance(inspect.getattr_static(HunyuanImage3ForCausalMM, name),
                                           staticmethod) else fn)
+
+    def _patch_vit_processor(self):
+        """transformers 5.x 的 Siglip2 image processor 預設回傳 list，官方的
+        `vit_process_image` 直接對它呼叫 `.squeeze(0)` 就爆了。補上 `return_tensors="pt"`。
+
+        跟分詞器那個是同一類問題：官方程式碼寫在舊版 transformers 上，新版改了回傳
+        型別。這種錯至少會當場拋例外，比分詞器那個安靜地壞掉好處理。
+        """
+        import torch
+        ip = self.image_processor
+
+        def vit_process_image(image):
+            origin = image.size
+            inputs = ip.vit_info.processor(image, return_tensors="pt")
+            px = inputs["pixel_values"]
+            if not torch.is_tensor(px):
+                px = torch.as_tensor(np.asarray(px))
+            extra = {}
+            for k in set(inputs.keys()) - {"pixel_values"}:
+                v = inputs[k]
+                if not torch.is_tensor(v):
+                    v = torch.as_tensor(np.asarray(v))
+                extra[k] = v.squeeze(0)
+            return ip.as_image_tensor(px.squeeze(0), image_type=ip.vit_info.image_type,
+                                      origin_size=origin, **extra)
+
+        ip.vit_process_image = vit_process_image
 
     def _load_tokenizer(self, cls):
         """`from_pretrained` 在 transformers 5.x 會把 tokenizer.json 的 BPE merges 與
@@ -157,7 +202,9 @@ class Conditioner:
         gi = out["batch_gen_image_info"][0]
         bsz = int(o.tokens.shape[0])
         rope = self._rope_info(o, sections)
+        cond = self._cond_images(o, out["batch_cond_images"], bsz) if image is not None else None
         return Conditioning(
+            cond=cond,
             tokens=o.tokens.numpy().astype(np.int32),
             gen_image_mask=o.gen_image_mask.numpy().astype(bool),
             gen_timestep_index=(None if o.gen_timestep_scatter_index is None
@@ -175,6 +222,31 @@ class Conditioner:
                                cfg_factor=1, bot_task=bot_task, **kw)
         o = out["output"]
         return o.tokens.numpy().astype(np.int32), out["stop_token_id"]
+
+    @staticmethod
+    def _idx(mask) -> np.ndarray:
+        m = np.asarray(mask)
+        return np.where(m)[1].reshape(m.shape[0], -1).astype(np.int32)
+
+    def _cond_images(self, o, batch_cond_images, bsz) -> "CondImages":
+        import torch
+        # cfg 的兩列共用同一張參考圖：無條件那列丟掉文字，但圖要留著
+        per_row = [bc[0] for bc in batch_cond_images]
+        if len(per_row) < bsz:
+            per_row = per_row * bsz
+        vae = np.stack([np.asarray(ci.vae_image, dtype=np.float32) for ci in per_row])
+        vit = np.stack([np.asarray(ci.vit_image, dtype=np.float32) for ci in per_row])
+        shapes, vmask = [], []
+        for ci in per_row:
+            k = ci.vit_image.vision_encoder_kwargs
+            shapes.append(tuple(int(v) for v in k["spatial_shapes"]))
+            vmask.append(np.asarray(k["pixel_attention_mask"], dtype=np.float32))
+        return CondImages(
+            vae_pixels=vae, vae_index=self._idx(o.vae_image_mask),
+            vit_pixels=vit, vit_index=self._idx(o.vit_image_mask),
+            vit_shapes=shapes, vit_mask=np.stack(vmask),
+            ts_index=np.asarray(o.cond_timestep_scatter_index, dtype=np.int32),
+        )
 
     def reference_attention_mask(self, c: Conditioning) -> np.ndarray:
         """官方 `_prepare_attention_mask_for_generation` 的結果，用來對答案。"""
