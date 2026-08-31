@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -268,13 +268,40 @@ def load_decoder(dec: Decoder, w: Dict[str, np.ndarray], dtype=mx.float32,
     return n
 
 
-def load_layer_quantized(layer: DecoderLayer, w: Dict[str, mx.array]) -> int:
-    """從 `tools/convert.py` 產生的 layer_NN.safetensors 載入。鍵名不含層前綴。"""
+def load_layer_quantized(layer: DecoderLayer, w: Dict[str, mx.array],
+                         src: Optional[Tuple[int, int]] = None,
+                         override: Optional[Dict[str, Tuple[int, int]]] = None) -> int:
+    """從 `tools/convert.py` 產生的 layer_NN.safetensors 載入。鍵名不含層前綴。
+
+    `override` 讓每一顆權重用不同的位元數（例如專家 4-bit、attention 8-bit）。
+    給了就在載入時解量化再量化，不必另外產生一份檔案——磁碟不夠的時候很有用。
+    鍵是前綴，值是 (bits, group_size)；`src` 是檔案本身的 (bits, group_size)。
+    """
     n = 0
+    override = override or {}
+
+    def _pick(p):
+        for k, v in override.items():
+            if p.startswith(k):
+                return v
+        return None
+
+    def _maybe_requant(p, w_, s_, b_):
+        tgt = _pick(p)
+        if tgt is None or src is None or tgt == src:
+            return w_, s_, b_
+        d = mx.dequantize(w_, s_, b_, group_size=src[1], bits=src[0]).astype(mx.float32)
+        out = mx.quantize(d, group_size=tgt[1], bits=tgt[0])
+        mx.eval(out)
+        return out
 
     def ql(mod, p):
         nonlocal n
-        mod.weight = w[p + ".weight"]; mod.scales = w[p + ".scales"]; mod.biases = w[p + ".biases"]
+        mod.weight, mod.scales, mod.biases = _maybe_requant(
+            p, w[p + ".weight"], w[p + ".scales"], w[p + ".biases"])
+        tgt = _pick(p)
+        if tgt is not None:
+            mod.bits, mod.group_size = tgt
         n += 3
 
     a = layer.self_attn
@@ -292,8 +319,13 @@ def load_layer_quantized(layer: DecoderLayer, w: Dict[str, mx.array]) -> int:
         ql(m.shared_mlp.gate_and_up_proj, "mlp.shared_mlp.gate_and_up_proj")
         ql(m.shared_mlp.down_proj, "mlp.shared_mlp.down_proj")
     for nm in ("up", "gate", "down"):
-        setattr(m.experts, f"{nm}_w", w[f"mlp.experts.{nm}.weight"])
-        setattr(m.experts, f"{nm}_s", w[f"mlp.experts.{nm}.scales"])
-        setattr(m.experts, f"{nm}_b", w[f"mlp.experts.{nm}.biases"])
+        p = f"mlp.experts.{nm}"
+        wq, sq, bq = _maybe_requant(p, w[p + ".weight"], w[p + ".scales"], w[p + ".biases"])
+        setattr(m.experts, f"{nm}_w", wq)
+        setattr(m.experts, f"{nm}_s", sq)
+        setattr(m.experts, f"{nm}_b", bq)
+        tgt = _pick(p)
+        if tgt is not None:
+            m.experts.bits, m.experts.group_size = tgt
         n += 3
     return n

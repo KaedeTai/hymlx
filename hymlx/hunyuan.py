@@ -158,7 +158,11 @@ def _scatter_rows(h: mx.array, idx: mx.array, src: mx.array) -> mx.array:
 class QuantizedHunyuan(nn.Module):
     """從 `tools/convert.py` 產出的目錄載入。整包約 46 GiB，可以整個常駐。"""
 
-    def __init__(self, qdir: str | Path, dtype=mx.bfloat16, layers: Optional[int] = None):
+    def __init__(self, qdir: str | Path, dtype=mx.bfloat16, layers: Optional[int] = None,
+                 requant: Optional[Dict[str, Tuple[int, int]]] = None):
+        """`requant` 讓某些權重在**載入時**改成別的位元數，不必另外產生檔案。
+        例如 {"": (4, 64)} 全部降成 4-bit；
+        {"mlp.experts": (4, 64)} 只把 64 顆專家降成 4-bit，attention 維持原樣。"""
         super().__init__()
         qdir = Path(qdir)
         cfg = json.load(open(qdir / "config.json"))
@@ -203,8 +207,13 @@ class QuantizedHunyuan(nn.Module):
         self._vision = self._aligner = self._encoder = None   # 編輯才載
         self.layers = []
         for i in range(self.n_layers):
+            # 一律用檔案本身的位元數建構，個別模組的覆寫交給 load_layer_quantized。
+            # 之前在這裡先猜一個 base，結果混合精度時 attention 的權重還是 8-bit、
+            # bits 卻被設成 4，形狀對不上就爆了。
             lyr = DecoderLayer(self.tc, i, self.q)
-            load_layer_quantized(lyr, mx.load(str(qdir / f"layer_{i:02d}.safetensors")))
+            load_layer_quantized(lyr, mx.load(str(qdir / f"layer_{i:02d}.safetensors")),
+                                 src=self.q, override=requant)
+            mx.eval(lyr.parameters())
             self.layers.append(lyr)
         mx.eval(self.parameters())
 

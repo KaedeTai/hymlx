@@ -153,6 +153,9 @@ def main() -> int:
     ap.add_argument("--system-prompt", default="en_unified")
     ap.add_argument("--no-cot", action="store_true")
     ap.add_argument("--cot-file", default=None, help="重用先前產生的 CoT，省掉文字階段")
+    ap.add_argument("--requant", default=None,
+                    help="載入時即時重量化，不必另外產生檔案。"
+                         "例如 '4,64' 全部降 4-bit；'mlp.experts=4,64' 只降專家。")
     ap.add_argument("--image", default=None,
                     help="參考圖（編輯）。同一張圖會同時走 VAE 與 ViT 兩條路。")
     ap.add_argument("--cfg-steps", type=int, default=None,
@@ -164,7 +167,14 @@ def main() -> int:
     names = a.names.split(",") if a.names else [f"dream_{i}" for i in range(len(a.prompts))]
     t0 = time.time()
     cond = Conditioner()
-    m = QuantizedHunyuan(a.model)
+    rq = None
+    if a.requant:
+        rq = {}
+        for part in a.requant.split(";"):
+            key, _, spec = part.rpartition("=")
+            b, g = (int(v) for v in spec.split(","))
+            rq[key] = (b, g)
+    m = QuantizedHunyuan(a.model, requant=rq)
     vcfg = json.load(open(Path(a.model) / "config.json"))["vae"]
     K = ("in_channels", "out_channels", "latent_channels", "block_out_channels",
          "layers_per_block", "ffactor_spatial", "ffactor_temporal",
