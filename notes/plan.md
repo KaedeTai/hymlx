@@ -370,3 +370,34 @@ sigma=1.0 的 x0 估計本來就沒有內容可言，兩個量化版本各自亂
 
 **原始 bf16、8-bit、6-bit 都已經刪掉**，這份 52.5 GiB 是唯一的母版。
 可以再往下降（4-bit 全面），但升不回去——要更高精度只能重下官方權重（約 25 分鐘）。
+
+## 發佈
+
+- 程式：https://github.com/KaedeTai/hymlx （公開、MIT）
+- 權重：https://huggingface.co/KaedeTai/HunyuanImage-3.0-mlx-mixed4-8-hymlx
+  （52.5 GiB，專家 4-bit、其餘 8-bit）
+
+### 授權處理
+
+騰訊的 Community License **允許發佈衍生權重**，但要求三件事，都做了：
+附授權全文（`LICENSE`）、註明改了什麼（`NOTICE` 與 model card）、
+放指定字樣的 NOTICE（"Tencent Hunyuan is licensed under the Tencent Hunyuan
+Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved."）。
+
+兩個限制寫進 README 與 model card：**授權不適用於歐盟、英國、南韓**；
+超過一億月活躍使用者要另外向騰訊取得授權。
+
+### 發佈前處理掉的依賴
+
+hymlx 原本 import `~/repos/hunyuan-study/hy/`——我自己組的騰訊原始碼複本。
+那不能跟 MIT 的程式一起發。改成 `ensure_official_code()` 在執行時從騰訊的 HF repo
+下載那十二支 .py，再用 `register_official_package()` 把快照目錄掛成一個叫 `hy`
+的套件（給它一個 `__path__`，不複製任何檔案），相對匯入就解得開。
+使用者以騰訊的授權取得那些檔案，跟權重同一條路。
+從一個完全無關的目錄重跑驗證過，不再依賴本機那份。
+
+### 上傳速度：我估錯了十倍
+
+我用「累積送出位元組 ÷ 經過時間」算出 11.6 MB/s，跟使用者說要 80 分鐘。
+實際 **485 秒**。錯在前幾分鐘是本機雜湊與去重、根本還沒開始傳，
+那段時間被算進分母了。要估傳輸速率就要取兩個時間點的差，不要用單次累積值除以總時間。
