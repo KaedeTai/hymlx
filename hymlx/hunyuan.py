@@ -261,8 +261,11 @@ class QuantizedHunyuan(nn.Module):
              "layers_per_block", "ffactor_spatial", "ffactor_temporal",
              "upsample_match_channel", "downsample_match_channel", "scaling_factor")
         self._vae_cfg = VAEConfig(**{k: vc[k] for k in K})
+        # VAE 在 1024x1024 x 4 幀 x 128 通道上跑，一個中間張量 fp32 就 2 GiB。
+        # 官方自己的 vae_autocast_dtype 是 float16，所以 bf16 不是偷工，是照做。
         self._encoder = Encoder(self._vae_cfg)
-        load_encoder(self._encoder, mx.load(str(self.qdir / "vae.safetensors")))
+        load_encoder(self._encoder, mx.load(str(self.qdir / "vae.safetensors")),
+                     dtype=mx.bfloat16)
         mx.eval(self._vision.parameters(), self._aligner.parameters(),
                 self._encoder.parameters())
 
@@ -273,9 +276,13 @@ class QuantizedHunyuan(nn.Module):
         （logvar 平均 -14.5，標準差約 7e-4，取樣與取平均沒有差別）。
         """
         self._load_cond_encoders()
-        x = mx.repeat(pixels[:, :, None], self._vae_cfg.ffactor_temporal, axis=2)
-        z = self._encoder(x)[:, :self._vae_cfg.latent_channels, 0]
-        return z * self._vae_cfg.scaling_factor
+        # CFG 的兩列共用同一張參考圖，編碼一次就好——編兩次是把 28 GiB 的峰值變兩倍。
+        one = pixels[0:1]
+        x = mx.repeat(one[:, :, None], self._vae_cfg.ffactor_temporal, axis=2)
+        z = self._encoder(x.astype(mx.bfloat16))[:, :self._vae_cfg.latent_channels, 0]
+        z = (z * self._vae_cfg.scaling_factor).astype(mx.float32)
+        mx.eval(z)
+        return mx.broadcast_to(z, (pixels.shape[0],) + z.shape[1:])
 
     def embed_prefix(self, tokens: mx.array, cond=None) -> mx.array:
         """前綴的 embedding。有參考圖就把 VAE latent 與 ViT 特徵蓋進去。"""
@@ -285,12 +292,19 @@ class QuantizedHunyuan(nn.Module):
         self._load_cond_encoders()
         B, S, D = h.shape
         t0 = mx.zeros((B,))
-        lat = self.encode_cond_image(mx.array(cond.vae_pixels))
-        img, _, _ = self.patch_embed(lat, self.time_embed(t0))
-        h = _scatter_rows(h, mx.array(cond.vae_index), img)
+        # 每一段都當場求值。不這樣做的話 VAE 編碼器、視覺塔、後面 32 層 decoder
+        # 會全部堆在同一張懶惰的圖裡，峰值記憶體多出二十幾 GiB——VAE 編碼器光第一層
+        # 卷積在 (2, 4, 1024, 1024, 128) 就是 2.1 GB。
+        lat = self.encode_cond_image(mx.array(cond.vae_pixels)); mx.eval(lat)
+        img, _, _ = self.patch_embed(lat, self.time_embed(t0)); mx.eval(img)
+        del lat; mx.clear_cache()
+        h = _scatter_rows(h, mx.array(cond.vae_index), img); mx.eval(h)
+        del img
         feat = self._aligner(self._vision(mx.array(cond.vit_pixels), cond.vit_shapes,
                                           mx.array(cond.vit_mask)))
-        h = _scatter_rows(h, mx.array(cond.vit_index), feat)
+        mx.eval(feat)
+        h = _scatter_rows(h, mx.array(cond.vit_index), feat); mx.eval(h)
+        del feat; mx.clear_cache()
         h = _scatter_rows(h, mx.array(cond.ts_index),
                           self.timestep_emb(t0).reshape(B, -1, D))
         return h
@@ -300,6 +314,7 @@ class QuantizedHunyuan(nn.Module):
         """把 <timestep> 之前的整段跑一次，留下每一層的 k/v。只做一次。"""
         caches = self.new_caches()
         h = self.embed_prefix(tokens, cond)
+        mx.eval(h)
         if cond is not None:
             # 視覺塔與 VAE 編碼器只在這裡用一次。模型本體已經佔 84 GiB，
             # 編輯的序列又比文生圖長一倍，留著這 2.2 GiB 會把機器推進 swap。
@@ -307,7 +322,9 @@ class QuantizedHunyuan(nn.Module):
             mx.clear_cache()
         for i, lyr in enumerate(self.layers):
             h = lyr(h, cos, sin, mask, caches[i])
-        mx.eval([a for c in caches for a in c])
+            mx.eval(h, *caches[i])          # 逐層求值，峰值才壓得下來
+        del h
+        mx.clear_cache()
         return caches
 
     def image_step(self, prefix_caches, latents: mx.array, t: mx.array,
@@ -322,11 +339,13 @@ class QuantizedHunyuan(nn.Module):
         h = self.timestep_emb(t).reshape(t.shape[0], 1, self.hidden)
         for i, lyr in enumerate(self.layers):
             h = lyr(h, cos_ts, sin_ts, None, caches[i])
+            mx.eval(h, *caches[i])
 
         # 2. 影像 token：對前綴、timestep、彼此全連通，mask=None 就是正確答案
         h, _, _ = self.patch_embed(latents, self.time_embed(t))
         for i, lyr in enumerate(self.layers):
             h = lyr(h, cos_img, sin_img, None, caches[i])
+            mx.eval(h, *caches[i])
         return self.final_layer(h, self.time_embed_2(t), token_h, token_w)
 
     def __call__(self, tokens, latents, t, image_mask, timestep_index,

@@ -123,9 +123,11 @@ def render(m, cond, dec, vc, prompt, cot, sys_prompt, size, steps, guidance, shi
     del caches, caches1; mx.clear_cache()
     if dec is None:
         from hymlx.vae import Decoder, load_decoder
-        dec = Decoder(vc); load_decoder(dec, mx.load(str(model_dir / "vae.safetensors")))
+        dec = Decoder(vc)
+        load_decoder(dec, mx.load(str(model_dir / "vae.safetensors")), dtype=mx.bfloat16)
         mx.eval(dec.parameters())
-    img = np.array(decode_image(dec, x / vc.scaling_factor), copy=False)[0, :, -1]
+    img = np.array(decode_image(dec, (x / vc.scaling_factor).astype(mx.bfloat16)
+                                ).astype(mx.float32), copy=False)[0, :, -1]
     img = np.clip((img + 1) / 2, 0, 1).transpose(1, 2, 0)
     Image.fromarray((img * 255).round().astype(np.uint8)).save(out_path)
     log(f"    {steps} 步 {dt:.0f}s（{dt/steps:.1f}s/步）-> {Path(out_path).name}")
