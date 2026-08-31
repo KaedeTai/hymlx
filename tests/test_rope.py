@@ -5,7 +5,8 @@ import contextlib, json, sys
 from pathlib import Path
 import numpy as np, torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-STUDY = Path.home() / "repos/hunyuan-study"; sys.path.insert(0, str(STUDY))
+from hymlx.conditioning import ensure_official_code, register_official_package, snapshot_dir
+register_official_package(ensure_official_code()); STUDY = Path(snapshot_dir())
 torch.cuda.set_device = lambda *a, **k: None
 torch.cuda.nvtx.range = lambda *a, **k: contextlib.nullcontext()
 CFG = json.load(open(STUDY / "config.json"))

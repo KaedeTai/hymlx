@@ -14,7 +14,8 @@ import numpy as np, torch
 from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-STUDY = Path.home() / "repos/hunyuan-study"
+from hymlx.conditioning import ensure_official_code, register_official_package, snapshot_dir
+register_official_package(ensure_official_code()); STUDY = Path(snapshot_dir())
 sys.path.insert(0, str(STUDY))
 torch.cuda.set_device = lambda *a, **k: None
 import contextlib

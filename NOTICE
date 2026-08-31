@@ -1,0 +1,38 @@
+Tencent Hunyuan is licensed under the Tencent Hunyuan Community License
+Agreement, Copyright (C) 2025 Tencent. All Rights Reserved.
+
+--------------------------------------------------------------------------
+
+This repository (hymlx) contains an independent MLX reimplementation of the
+HunyuanImage-3.0 architecture, written from the published PyTorch reference.
+The code here is MIT licensed; see LICENSE.
+
+It does NOT contain any Tencent source code or model weights. At run time it
+downloads the official Python modules and the tokenizer from Tencent's
+HuggingFace repository into the HuggingFace cache and imports them from there,
+so those files reach you under Tencent's own licence.
+
+Any quantised checkpoint produced by tools/convert.py or tools/requantize.py is
+a Model Derivative of Tencent Hunyuan and remains subject to the Tencent
+Hunyuan Community License Agreement:
+
+    https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
+
+Changes made in producing such a checkpoint (as required by Section 3(b) of
+that agreement):
+
+  - Weights converted from PyTorch bf16 safetensors to MLX safetensors.
+  - Affine group quantisation applied (group size 64). In the released
+    checkpoint the 64 routed experts of every layer are quantised to 4 bits and
+    all other quantised tensors to 8 bits.
+  - Left in bfloat16, unquantised: all normalisation weights, the MoE routing
+    gate (mlp.gate.wg), patch_embed, final_layer, time_embed, time_embed_2,
+    timestep_emb, the VAE and the SigLIP2 vision tower.
+  - The tensor layout was rearranged for MLX (channels-last convolutions;
+    the packed gate_and_up_proj split into separate up and gate halves; the
+    per-layer experts stacked into a single tensor).
+  - No fine-tuning, distillation or other training was performed. Behaviour is
+    intended to match the original within quantisation error.
+
+Territory: the Tencent Hunyuan Community License Agreement does not apply in
+the European Union, the United Kingdom or South Korea.

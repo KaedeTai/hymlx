@@ -17,6 +17,9 @@ import shutil
 import time
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import mlx.core as mx
 import numpy as np
 from safetensors import safe_open
@@ -58,8 +61,9 @@ def main() -> int:
                          "就是在新檔，不會兩頭空。")
     a = ap.parse_args()
 
-    study = Path.home() / "repos/hunyuan-study"
+    from hymlx.conditioning import ensure_official_code
     snap = snapshot()
+    study = Path(ensure_official_code())
     cfg = json.load(open(study / "config.json"))
     index = json.load(open(study / "model.safetensors.index.json"))
     r = Reader(snap, index)

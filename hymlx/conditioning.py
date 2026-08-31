@@ -24,8 +24,49 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
-def _study_path() -> Path:
-    return Path.home() / "repos/hunyuan-study"
+# 官方那幾支 Python（tokenizer、image processor、序列組裝）我們**不重寫也不夾帶**：
+# 兩千多行純邏輯、沒有一個矩陣乘法，重寫只會多一份會跟上游不同步的 bug。
+# 這裡在執行時從官方的 HF repo 抓下來，使用者以騰訊的授權取得，跟權重同一條路。
+OFFICIAL_MODULES = (
+    "__init__.py",
+    "configuration_hunyuan_image_3.py",
+    "tokenization_hunyuan_image_3.py",
+    "image_processor.py",
+    "system_prompt.py",
+    "siglip2.py",
+    "autoencoder_kl_3d.py",
+    "hunyuan_image_3_pipeline.py",
+    "cache_utils.py",
+    "modeling_hunyuan_image_3.py",
+    "utils/__init__.py",
+    "utils/import_utils.py",
+)
+REPO_ID = "tencent/HunyuanImage-3.0-Instruct"
+
+
+def ensure_official_code(repo_id: str = REPO_ID) -> str:
+    """把官方的 .py 抓進 HF 快取，回傳那個目錄。"""
+    from huggingface_hub import hf_hub_download
+    d = None
+    for f in OFFICIAL_MODULES:
+        d = Path(hf_hub_download(repo_id, f)).parent
+        if "/" in f:
+            d = d.parent
+    return str(d)
+
+
+def register_official_package(snapshot: str, name: str = "hy") -> None:
+    """把快照目錄掛成一個叫 `hy` 的套件，讓官方檔案裡的相對匯入解得開。
+
+    不複製任何檔案——只是給 Python 一個 `__path__`。
+    """
+    import sys as _sys
+    import types as _types
+    if name in _sys.modules:
+        return
+    pkg = _types.ModuleType(name)
+    pkg.__path__ = [snapshot]
+    _sys.modules[name] = pkg
 
 
 def snapshot_dir() -> str:
@@ -91,12 +132,10 @@ class Conditioner:
     tokenizer、image_processor），不需要把 80B 的權重載進來。
     """
 
-    def __init__(self, study: Optional[Path] = None, snapshot: Optional[str] = None):
-        import sys
-        study = Path(study or _study_path())
-        if str(study) not in sys.path:
-            sys.path.insert(0, str(study))
+    def __init__(self, snapshot: Optional[str] = None):
         _install_cuda_stubs()
+        self.snapshot = snapshot or snapshot_dir()
+        register_official_package(ensure_official_code())
 
         from hy.configuration_hunyuan_image_3 import HunyuanImage3Config
         from hy.image_processor import HunyuanImage3ImageProcessor
@@ -104,8 +143,7 @@ class Conditioner:
         from hy.tokenization_hunyuan_image_3 import HunyuanImage3TokenizerFast
         from transformers import GenerationConfig
 
-        self.snapshot = snapshot or snapshot_dir()
-        self.raw_config = json.load(open(study / "config.json"))
+        self.raw_config = json.load(open(f"{self.snapshot}/config.json"))
         self.config = HunyuanImage3Config(**self.raw_config)
         self.image_processor = HunyuanImage3ImageProcessor(self.config)
         self._patch_vit_processor()

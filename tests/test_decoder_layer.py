@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np, torch
 from safetensors import safe_open
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-STUDY = Path.home() / "repos/hunyuan-study"; sys.path.insert(0, str(STUDY))
+from hymlx.conditioning import ensure_official_code, register_official_package, snapshot_dir
+register_official_package(ensure_official_code()); STUDY = Path(snapshot_dir())
 torch.cuda.set_device = lambda *a, **k: None
 torch.cuda.nvtx.range = lambda *a, **k: contextlib.nullcontext()
 SNAP = glob.glob(str(Path.home() / ".cache/huggingface/hub/models--tencent--HunyuanImage-3.0-Instruct/snapshots/*"))[0]
