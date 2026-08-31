@@ -224,6 +224,46 @@ class QuantizedHunyuan(nn.Module):
     def new_caches(self):
         return [[] for _ in range(self.n_layers)]
 
+    # ------------------------------------------------------------------
+    # 影像生成的 KV cache
+    #
+    # 取樣的每一步，文字前綴（系統提示詞 + prompt + CoT，兩千多個 token）都是
+    # 一模一樣的，重算 50 次是白費。而且一旦把前綴的 k/v 快取起來，**遮罩就整個
+    # 不需要了**：影像 token 本來就看得到全部的文字與彼此，而 timestep token
+    # 不能看影像——把它單獨先跑一遍就自然滿足了，不必materialise 一張
+    # 6278x6278 的遮罩（fp32 315 MB，每層都要讀一次）。
+    # 序列尾巴 <eoi> 之後的文字也不用算，final_layer 根本不讀它們。
+    # ------------------------------------------------------------------
+
+    def prefill_prefix(self, tokens: mx.array, cos: mx.array, sin: mx.array,
+                       mask: mx.array):
+        """把 <timestep> 之前的整段文字跑一次，留下每一層的 k/v。只做一次。"""
+        caches = self.new_caches()
+        h = self.embed_tokens(tokens)
+        for i, lyr in enumerate(self.layers):
+            h = lyr(h, cos, sin, mask, caches[i])
+        mx.eval([a for c in caches for a in c])
+        return caches
+
+    def image_step(self, prefix_caches, latents: mx.array, t: mx.array,
+                   cos_ts: mx.array, sin_ts: mx.array,
+                   cos_img: mx.array, sin_img: mx.array,
+                   token_h: int, token_w: int) -> mx.array:
+        """一步去噪。prefix_caches 不會被改到，每一步都從它重新長出來。"""
+        caches = [list(c) for c in prefix_caches]
+
+        # 1. timestep token 先單獨走完 32 層。它在序列上排在影像之前，看不到影像，
+        #    所以先跑它，之後影像那一段就可以完全不用遮罩。
+        h = self.timestep_emb(t).reshape(t.shape[0], 1, self.hidden)
+        for i, lyr in enumerate(self.layers):
+            h = lyr(h, cos_ts, sin_ts, None, caches[i])
+
+        # 2. 影像 token：對前綴、timestep、彼此全連通，mask=None 就是正確答案
+        h, _, _ = self.patch_embed(latents, self.time_embed(t))
+        for i, lyr in enumerate(self.layers):
+            h = lyr(h, cos_img, sin_img, None, caches[i])
+        return self.final_layer(h, self.time_embed_2(t), token_h, token_w)
+
     def __call__(self, tokens, latents, t, image_mask, timestep_index,
                  cos, sin, mask, token_h, token_w, progress=None):
         h = self.embed_tokens(tokens)

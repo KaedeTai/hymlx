@@ -63,34 +63,46 @@ def main() -> int:
     print(f"模型載入 {time.time()-t0:.0f}s")
 
     D = m.head_dim
-    cos_l, sin_l = [], []
-    for info in c.rope_image_info:
-        cc, ss = build_batch_2d_rope(c.seq_len, D, image_infos=[info], base=m.rope_theta)
-        cos_l.append(cc[0]); sin_l.append(ss[0])
-    cos, sin = mx.stack(cos_l), mx.stack(sin_l)
-    mask = mx.concatenate([build_attention_mask(c.seq_len, sl) for sl in c.full_attn_slices])
-    amask = mx.where(mask, mx.array(0.0, mx.float32), mx.array(-3.4028235e38, mx.float32))
+    cos = mx.stack([build_batch_2d_rope(c.seq_len, D, image_infos=[i], base=m.rope_theta)[0][0]
+                    for i in c.rope_image_info])
+    sin = mx.stack([build_batch_2d_rope(c.seq_len, D, image_infos=[i], base=m.rope_theta)[1][0]
+                    for i in c.rope_image_info])
+    B = c.batch                                     # 2：有條件 + 無條件
+    P = int(c.gen_timestep_index[0][0])             # <timestep> 的位置
+    istart = int(np.where(c.gen_image_mask[0])[0][0])
+    iend = int(np.where(c.gen_image_mask[0])[0][-1]) + 1
+    assert istart == P + 1, "影像沒有緊接在 <timestep> 之後，快取路徑的前提不成立"
 
-    tokens = mx.array(c.tokens.astype(np.int32))
-    image_mask = mx.array(c.gen_image_mask)
-    ts_index = None if c.gen_timestep_index is None else mx.array(c.gen_timestep_index)
+    # 文字前綴每一步都一樣，只跑一次。之後影像那段連遮罩都不需要——理由見
+    # hunyuan.py 的 image_step。
+    t0 = time.time()
+    pmask = mx.broadcast_to(build_attention_mask(P)[0], (B, 1, P, P))
+    pam = mx.where(pmask, mx.array(0.0, mx.float32), mx.array(-3.4028235e38, mx.float32))
+    caches = m.prefill_prefix(mx.array(c.tokens[:, :P].astype(np.int32)),
+                              cos[:, :P], sin[:, :P], pam)
+    del pmask, pam
+    mx.clear_cache()
+    print(f"前綴預填 {P} token  {time.time()-t0:.0f}s")
+    cos_ts, sin_ts = cos[:, P:P + 1], sin[:, P:P + 1]
+    cos_img, sin_img = cos[:, istart:iend], sin[:, istart:iend]
 
     rs = np.random.RandomState(a.seed)
     x = mx.array(rs.randn(1, m.latent_channels, c.token_h, c.token_w).astype(np.float32))
     sigmas, timesteps = sigma_schedule(a.steps, a.shift)
-    B = c.batch                                     # 2：有條件 + 無條件
 
     t_all = time.time()
     for i in range(a.steps):
         t_step = time.time()
-        xin = mx.repeat(x, B, axis=0)
-        tt = mx.full((B,), float(timesteps[i]))
-        pred = m(tokens, xin, tt, image_mask, ts_index, cos, sin, amask,
-                 c.token_h, c.token_w)
-        pred = pred.astype(mx.float32)
+        pred = m.image_step(caches, mx.repeat(x, B, axis=0),
+                            mx.full((B,), float(timesteps[i])),
+                            cos_ts, sin_ts, cos_img, sin_img,
+                            c.token_h, c.token_w).astype(mx.float32)
         v = apply_cfg(pred[0:1], pred[1:2], a.guidance) if B == 2 else pred
         x = x + v * float(sigmas[i + 1] - sigmas[i])
         mx.eval(x)
+        # 每一步會產生約 1.6 GB 的 k/v 暫存（前綴與影像段串接的結果）。
+        # 模型本身已經常駐 84 GiB，讓 MLX 的緩衝池一直長會把機器推進換頁。
+        mx.clear_cache()
         print(f"  步 {i+1:>2}/{a.steps}  {time.time()-t_step:.1f}s", flush=True)
     print(f"取樣 {time.time()-t_all:.0f}s（{(time.time()-t_all)/a.steps:.1f}s/步）")
 
