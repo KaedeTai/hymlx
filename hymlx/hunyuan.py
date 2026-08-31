@@ -168,6 +168,9 @@ class QuantizedHunyuan(nn.Module):
         cfg = json.load(open(qdir / "config.json"))
         qc = json.load(open(qdir / "quant_config.json"))
         self.qdir, self.raw_cfg, self.q = qdir, cfg, (qc["bits"], qc["group_size"])
+        # 檔案裡本來就是混合精度的話，quant_config 會記著每一段用幾位。
+        # 這時候不要重量化，只要把每個模組的 bits 設對就好（src=None 就是這個意思）。
+        self._layout = {k: tuple(v) for k, v in (qc.get("overrides") or {}).items()}
         self.wdtype = dtype
         self.tc = TextConfig.from_json(cfg)
         self.hidden = cfg["hidden_size"]
@@ -211,8 +214,12 @@ class QuantizedHunyuan(nn.Module):
             # 之前在這裡先猜一個 base，結果混合精度時 attention 的權重還是 8-bit、
             # bits 卻被設成 4，形狀對不上就爆了。
             lyr = DecoderLayer(self.tc, i, self.q)
-            load_layer_quantized(lyr, mx.load(str(qdir / f"layer_{i:02d}.safetensors")),
-                                 src=self.q, override=requant)
+            if requant:
+                load_layer_quantized(lyr, mx.load(str(qdir / f"layer_{i:02d}.safetensors")),
+                                     src=self.q, override={**self._layout, **requant})
+            else:
+                load_layer_quantized(lyr, mx.load(str(qdir / f"layer_{i:02d}.safetensors")),
+                                     src=None, override=self._layout)
             mx.eval(lyr.parameters())
             self.layers.append(lyr)
         mx.eval(self.parameters())

@@ -35,7 +35,15 @@ def requant(w, s, b, src_bits, dst_bits, gs):
     return mx.quantize(d, group_size=gs, bits=dst_bits)
 
 
-def convert_file(src: Path, dst: Path, src_bits: int, dst_bits: int, gs: int):
+def _target(base: str, dst_bits: int, gs: int, override):
+    """回傳這顆權重要用的 (bits, group_size)；沒有覆寫就用預設。"""
+    for k, v in (override or {}).items():
+        if base.startswith(k):
+            return v
+    return (dst_bits, gs)
+
+
+def convert_file(src: Path, dst: Path, src_bits: int, dst_bits: int, gs: int, override=None):
     d = mx.load(str(src))
     out, n = {}, 0
     names = {k[:-7] for k in d if k.endswith(".scales")}
@@ -45,8 +53,13 @@ def convert_file(src: Path, dst: Path, src_bits: int, dst_bits: int, gs: int):
             continue
         out[k] = v
     for base in sorted(names):
+        tb, tg = _target(base, dst_bits, gs, override)
+        if (tb, tg) == (src_bits, gs):
+            for suf in (".weight", ".scales", ".biases"):
+                out[base + suf] = d[base + suf]     # 目標就是原樣，直接搬
+            continue
         w, s, b = requant(d[base + ".weight"], d[base + ".scales"], d[base + ".biases"],
-                          src_bits, dst_bits, gs)
+                          src_bits, tb, gs if tg == gs else tg)
         out[base + ".weight"], out[base + ".scales"], out[base + ".biases"] = w, s, b
         n += 1
     mx.eval(list(out.values()))
@@ -61,12 +74,22 @@ def main() -> int:
     ap.add_argument("--src", default=str(Path.home() / "models/hymlx-8bit"))
     ap.add_argument("--out", default=str(Path.home() / "models/hymlx-6bit"))
     ap.add_argument("--bits", type=int, default=6)
+    ap.add_argument("--override", default=None,
+                    help="讓某些權重用不同位元數，例如 'mlp.experts=4,64'。"
+                         "沒被指到的用 --bits。分號分隔多組。")
     a = ap.parse_args()
     src, out = Path(a.src), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     qc = json.load(open(src / "quant_config.json"))
     sb, gs = qc["bits"], qc["group_size"]
-    print(f"{sb}-bit -> {a.bits}-bit（group {gs}），來源 {src}")
+    override = {}
+    for part in (a.override or "").split(";"):
+        if part.strip():
+            k, _, spec = part.rpartition("=")
+            b_, g_ = (int(v) for v in spec.split(","))
+            override[k] = (b_, g_)
+    print(f"{sb}-bit -> {a.bits}-bit（group {gs}），來源 {src}"
+          + (f"，覆寫 {override}" if override else ""))
     mx.set_default_device(mx.cpu)
 
     t_all = time.time()
@@ -79,13 +102,15 @@ def main() -> int:
             print(f"  {f.name}: 原樣複製 {sz/2**30:.2f} GiB", flush=True)
             continue
         t0 = time.time()
-        n = convert_file(f, out / f.name, sb, a.bits, gs)
+        n = convert_file(f, out / f.name, sb, a.bits, gs, override)
         sz = (out / f.name).stat().st_size
         total += sz
         print(f"  {f.name}: 重量化 {n} 組 {f.stat().st_size/2**30:.2f} -> "
               f"{sz/2**30:.2f} GiB  {time.time()-t0:.0f}s", flush=True)
 
     meta = dict(qc); meta["bits"] = a.bits
+    if override:
+        meta["overrides"] = {k: list(v) for k, v in override.items()}
     meta["derived_from"] = f"{sb}-bit（二次量化，實測比從 bf16 直接做差 3.2%）"
     (out / "quant_config.json").write_text(json.dumps(meta, indent=2))
     shutil.copy(src / "config.json", out / "config.json")
