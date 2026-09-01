@@ -227,15 +227,20 @@ class QuantizedHunyuan(nn.Module):
     def embed_tokens(self, tokens: mx.array) -> mx.array:
         return self.wte[tokens]
 
-    def logits(self, tokens: mx.array, cos: mx.array, sin: mx.array,
-               mask=None, caches=None) -> mx.array:
+    def logits(self, tokens, cos: mx.array, sin: mx.array,
+               mask=None, caches=None, embeds=None) -> mx.array:
         """純文字模式：走 ln_f + lm_head。影像模式**不走** ln_f，這是兩條不同的路。
 
         caches 是 32 個 [k, v]；給了就是增量解碼，只餵新的 token。
+        `embeds` 讓呼叫端自己準備好 embedding——編輯的文字階段序列裡有參考圖，
+        那幾千個位置不是 token 查表得到的，是 VAE latent 與 ViT 特徵蓋上去的。
         """
-        h = self.embed_tokens(tokens)
+        h = self.embed_tokens(tokens) if embeds is None else embeds
+        step = h.shape[1] > 512      # 長前綴逐層求值，不然整張懶惰圖會把峰值頂上去
         for i, lyr in enumerate(self.layers):
             h = lyr(h, cos, sin, mask, None if caches is None else caches[i])
+            if step:
+                mx.eval(h, *(caches[i] if caches is not None else ()))
         h = self.ln_f(h[:, -1:, :])
         return self.lm_head(h)[:, 0]
 
@@ -300,29 +305,49 @@ class QuantizedHunyuan(nn.Module):
         mx.eval(z)
         return mx.broadcast_to(z, (pixels.shape[0],) + z.shape[1:])
 
+    def cond_features(self, cond):
+        """參考圖 -> (VAE patch embedding, ViT 特徵)，兩者都是 B=1。
+
+        編輯要跑兩個階段（文字寫 recaption、影像去噪），**兩階段是同一張圖**，
+        只是落在序列的不同位置。所以編碼一次就好：VAE 編碼器在 1024² 上一次
+        要十幾秒與二十幾 GiB，跑兩次純粹是浪費。CFG 的兩列也共用同一份。
+        """
+        import hashlib
+        px = np.ascontiguousarray(cond.vae_pixels[0])
+        key = hashlib.blake2b(px.tobytes(), digest_size=16).digest()
+        if getattr(self, "_cond_key", None) == key:
+            return self._cond_feat
+        self._load_cond_encoders()
+        t0 = mx.zeros((1,))
+        # 每一段都當場求值。不這樣做的話 VAE 編碼器、視覺塔、後面 32 層 decoder
+        # 會全部堆在同一張懶惰的圖裡，峰值記憶體多出二十幾 GiB——VAE 編碼器光第一層
+        # 卷積在 (2, 4, 1024, 1024, 128) 就是 2.1 GB。
+        lat = self.encode_cond_image(mx.array(cond.vae_pixels[0:1])); mx.eval(lat)
+        img, _, _ = self.patch_embed(lat, self.time_embed(t0)); mx.eval(img)
+        del lat; mx.clear_cache()
+        feat = self._aligner(self._vision(mx.array(cond.vit_pixels[0:1]),
+                                          cond.vit_shapes[0:1],
+                                          mx.array(cond.vit_mask[0:1])))
+        mx.eval(feat)
+        mx.clear_cache()
+        self._cond_key, self._cond_feat = key, (img, feat)
+        return self._cond_feat
+
     def embed_prefix(self, tokens: mx.array, cond=None) -> mx.array:
         """前綴的 embedding。有參考圖就把 VAE latent 與 ViT 特徵蓋進去。"""
         h = self.embed_tokens(tokens)
         if cond is None:
             return h
-        self._load_cond_encoders()
         B, S, D = h.shape
-        t0 = mx.zeros((B,))
-        # 每一段都當場求值。不這樣做的話 VAE 編碼器、視覺塔、後面 32 層 decoder
-        # 會全部堆在同一張懶惰的圖裡，峰值記憶體多出二十幾 GiB——VAE 編碼器光第一層
-        # 卷積在 (2, 4, 1024, 1024, 128) 就是 2.1 GB。
-        lat = self.encode_cond_image(mx.array(cond.vae_pixels)); mx.eval(lat)
-        img, _, _ = self.patch_embed(lat, self.time_embed(t0)); mx.eval(img)
-        del lat; mx.clear_cache()
+        img, feat = self.cond_features(cond)
+        if B != img.shape[0]:
+            img = mx.broadcast_to(img, (B,) + img.shape[1:])
+            feat = mx.broadcast_to(feat, (B,) + feat.shape[1:])
         h = _scatter_rows(h, mx.array(cond.vae_index), img); mx.eval(h)
-        del img
-        feat = self._aligner(self._vision(mx.array(cond.vit_pixels), cond.vit_shapes,
-                                          mx.array(cond.vit_mask)))
-        mx.eval(feat)
         h = _scatter_rows(h, mx.array(cond.vit_index), feat); mx.eval(h)
-        del feat; mx.clear_cache()
+        mx.clear_cache()
         h = _scatter_rows(h, mx.array(cond.ts_index),
-                          self.timestep_emb(t0).reshape(B, -1, D))
+                          self.timestep_emb(mx.zeros((B,))).reshape(B, -1, D))
         return h
 
     def prefill_prefix(self, tokens: mx.array, cos: mx.array, sin: mx.array,
@@ -332,8 +357,9 @@ class QuantizedHunyuan(nn.Module):
         h = self.embed_prefix(tokens, cond)
         mx.eval(h)
         if cond is not None:
-            # 視覺塔與 VAE 編碼器只在這裡用一次。模型本體已經佔 84 GiB，
-            # 編輯的序列又比文生圖長一倍，留著這 2.2 GiB 會把機器推進 swap。
+            # 視覺塔與 VAE 編碼器的輸出已經在 `cond_features` 裡快取，可以卸掉。
+            # 模型本體已經佔 50 GiB，編輯的序列又比文生圖長一倍，
+            # 留著這 2.2 GiB 會把機器推進 swap。換圖時 `_load_cond_encoders` 會重載。
             self._vision = self._aligner = self._encoder = None
             mx.clear_cache()
         for i, lyr in enumerate(self.layers):

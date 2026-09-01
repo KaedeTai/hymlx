@@ -102,6 +102,21 @@ class CondImages:
 
 
 @dataclass
+class TextConditioning:
+    """文字階段（think / recaption）的序列資訊。
+
+    純文生圖時只有 tokens 有用；**編輯時文字階段的序列本身也含參考圖**，
+    所以跟影像階段一樣需要 rope 的 2D 段落、全連通區塊、以及參考圖本身。
+    """
+    tokens: np.ndarray                      # (B, S) int32
+    stop_ids: Any
+    rope_image_info: List[Any]
+    full_attn_slices: List[List[slice]]
+    cond: Optional["CondImages"] = None
+    raw: Any = None
+
+
+@dataclass
 class Conditioning:
     """一次生成需要的全部序列資訊。slice 都是對 tokens 的索引。"""
     tokens: np.ndarray                      # (B, S) int32
@@ -254,12 +269,32 @@ class Conditioner:
             raw=o,
         )
 
-    def build_text(self, prompt: str, system_prompt=None, bot_task: str = "think", **kw):
-        """gen_text 模式的序列（產生 think / recaption 用）。回傳 (tokens, stop_ids)。"""
-        out = self._preprocess(prompt=prompt, mode="gen_text", system_prompt=system_prompt,
+    def build_text(self, prompt: str, system_prompt=None, bot_task: str = "think",
+                   image=None, with_cond: bool = False, **kw):
+        """gen_text 模式的序列（產生 think / recaption 用）。
+
+        預設回傳 (tokens, stop_ids)，跟以前一樣。`with_cond=True` 回傳
+        `TextConditioning`——編輯時要用，因為官方在文字階段就把參考圖放進序列了
+        （`generate_image` 兩個階段都傳 `image=image`），模型是「看著圖」寫
+        recaption，不是只看指令文字。
+        """
+        out = self._preprocess(prompt=prompt, image=image, mode="gen_text",
+                               system_prompt=system_prompt,
                                cfg_factor=1, bot_task=bot_task, **kw)
         o = out["output"]
-        return o.tokens.numpy().astype(np.int32), out["stop_token_id"]
+        toks = o.tokens.numpy().astype(np.int32)
+        if not with_cond:
+            return toks, out["stop_token_id"]
+        bsz = int(o.tokens.shape[0])
+        return TextConditioning(
+            tokens=toks,
+            stop_ids=out["stop_token_id"],
+            rope_image_info=self._rope_info(o, out["sections"]),
+            full_attn_slices=self._full_attn_slices(o, bsz),
+            cond=(self._cond_images(o, out["batch_cond_images"], bsz)
+                  if image is not None else None),
+            raw=o,
+        )
 
     @staticmethod
     def _idx(mask) -> np.ndarray:

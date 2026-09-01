@@ -38,6 +38,12 @@ Four things that a port of a normal diffusion transformer will get wrong:
 4. **Editing feeds the reference image down two paths at once** — a VAE for
    pixel detail (4096 tokens) and SigLIP2 for semantics (1024 tokens) — as one
    jointly-attending block with the timestep pinned at 0.
+5. **Both stages see the reference image.** Editing is two stages like text to
+   image, and the official pipeline passes `image=` to the text stage as well:
+   the model looks at the picture while rewriting your instruction. That makes
+   the text-stage sequence 6368 tokens instead of 1235, so it needs the 2D RoPE
+   sections, the full-attention block and the scattered embeddings that until
+   now only the image stage had.
 
 ## Install
 
@@ -62,9 +68,11 @@ your own from the official bf16 release with `tools/convert.py`.
 # text to image (the model writes its own <think>/<recaption> first)
 python3 tools/dream.py "a portrait photograph of an elderly fisherman" --steps 14
 
-# reference-image editing
+# reference-image editing (the text stage sees the reference image too)
 python3 tools/dream.py "make the hamster wear a tiny red wizard hat" \
         --image hamster.png --steps 14
+
+# ...or skip the text stage and feed the raw instruction (`--no-cot`), ~45 s faster
 
 # reuse a chain-of-thought, and skip CFG after step 6 (about 20% faster)
 python3 tools/dream.py "..." --cot-file fox_cot.txt --cfg-steps 6
@@ -171,8 +179,14 @@ to re-download 157 GiB to change precision.
 |---|---|---|---|
 | text to image | 14 | 161 s | 2.7 min |
 | text to image, reusing a CoT | 14 | 161 s | 2.0 min |
-| reference-image editing | 14 | 182 s | 3.5 min |
+| reference-image editing | 14 | 193 s | 4.2 min |
+| reference-image editing, `--no-cot` | 14 | 194 s | 3.5 min |
 | chain-of-thought alone | 1100 tok | | 100 s |
+
+The edit's text stage costs 44 s: its prefix is 6368 tokens because the
+reference image is in it. The VAE and SigLIP2 encodings are cached across the
+two stages, so the image stage's prefill drops from 21 s to 14 s and the
+reference image is only encoded once.
 
 Step count: composition settles around 18 steps and texture around 22; 14 is
 usable and 28 is the point of diminishing returns. Because the step count

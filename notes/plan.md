@@ -401,3 +401,60 @@ hymlx 原本 import `~/repos/hunyuan-study/hy/`——我自己組的騰訊原始
 我用「累積送出位元組 ÷ 經過時間」算出 11.6 MB/s，跟使用者說要 80 分鐘。
 實際 **485 秒**。錯在前幾分鐘是本機雜湊與去重、根本還沒開始傳，
 那段時間被算進分母了。要估傳輸速率就要取兩個時間點的差，不要用單次累積值除以總時間。
+
+## 編輯接上 CoT
+
+發佈時我列了兩件沒做完的，這是其中之一。原本 `tools/dream.py` 只要看到
+`--image` 就把 CoT 關掉，理由是「文字階段的序列本身也含參考圖，要另外接」。
+
+官方 `generate_image` 的兩個階段**都傳 `image=`**：文字階段是看著參考圖寫
+recaption 的。實測序列長度差距：
+
+| 文字階段序列 | token |
+|---|---|
+| 純文字（文生圖） | 1235 |
+| 帶參考圖（編輯） | 6368（參考圖佔 4096 VAE + 1024 ViT，落在 1231–6352） |
+
+所以「另外接」是三件事：
+
+1. `Conditioner.build_text()` 要吃 `image=`，回傳 rope 的 2D 段落、全連通
+   slice、以及 `CondImages`（`with_cond=True` 回傳新的 `TextConditioning`）。
+2. `QuantizedHunyuan.logits()` 要吃 `embeds=`。那六千個位置有五千個不是
+   token 查表得到的，是 VAE latent 與 ViT 特徵蓋上去的。
+3. 前綴遮罩要讓參考圖那一整塊全連通，而且長前綴要逐層 `mx.eval`
+   （`h.shape[1] > 512` 時），不然 32 層堆在同一張懶惰圖裡峰值會頂上去。
+
+順手修掉一個浪費：`cond_features()` 把 VAE patch embedding 與 ViT 特徵用
+像素的 blake2b 當 key 快取起來。兩個階段是同一張圖，本來會編碼兩次。
+影像階段的預填因此從 21 s 掉到 14 s。CFG 的兩列也共用同一份（B=1 算完再 broadcast）。
+
+### A/B（同一張參考圖、seed 0、14 步，只差文字階段跑不跑）
+
+模型寫出來的 CoT 是**指令改寫**，不是整張畫面的描述——跟文生圖那段不一樣：
+
+> `<think>`…A wizard hat typically has a conical shape with a brim…`</think>`
+> `<recaption>`Add a small, red wizard hat to the top of the hamster's head.
+> The hat should have a pointed, conical shape with a distinct brim, and its
+> size should be perfectly proportioned to fit the hamster's head…`</recaption>`
+
+結果（`~/models/hymlx-out/cot_edit_compare.png`）：
+
+- 接上 CoT 的帽子**有帽簷**、圓錐比較正——就是 recaption 裡多寫的那幾個字。
+  不走 CoT 的是一頂無簷、帶星星裝飾的尖帽。
+- 但接上 CoT 的**毛色偏橘、毛流比參考圖粗**，離原圖更遠。不走 CoT 的比較貼近
+  參考圖的質感。
+- 所以這不是「壞掉 vs 正常」，是**指令服從度 vs 保留原圖**的取捨。跟文生圖那邊
+  CoT 帶來的差別（紋理湯 → 照片）完全不是同一個量級。我發佈時說「編輯因為指令
+  具體可能還好，但我沒測過」——測完了，當時那句是對的。
+- 成本：文字階段 44 s，編輯總時間 3.5 → 4.2 分鐘。想要原本的行為就加 `--no-cot`。
+
+### 順手抓到的一個我自己的 bug：CoT 上限訂太低
+
+接完之後跑文生圖的回歸測試，log 顯示「CoT 1101 token」——正好是我寫的
+`max_new=1100` 加一。去看 `regress_fox_cot.txt`，recaption 斷在
+「No other objects, vegetation, or structures are discern」，**斷在字中間**。
+影像階段吃到的是半句話。
+
+官方 `generation_config.json` 的 `max_new_tokens` 是 **2048**，我當初隨手寫 1100。
+之前 818 token 的那次沒撞到，所以一直沒發現。改回 2048，並且撞到上限時
+log 會明講被切斷了——這種錯不會拋例外，只會讓圖悄悄變差。

@@ -14,27 +14,48 @@ import mlx.core as mx
 import numpy as np
 
 
-def generate_cot(m, cond, prompt, sys_prompt, max_new=1100, temperature=0.6,
-                 top_p=0.95, top_k=1024, seed=0, log=print):
+def generate_cot(m, cond, prompt, sys_prompt, max_new=2048, temperature=0.6,
+                 top_p=0.95, top_k=1024, seed=0, image=None, log=print):
     """跑文字階段，讓模型自己寫 <think>…</think><recaption>…</recaption>。
 
     官方的圖像階段吃的是這段文字，不是使用者的原句。沒有它模型是在分布外跑。
+
+    編輯（給了 `image`）時，官方的 `generate_image` **兩個階段都傳 image**：
+    文字階段的序列裡就有那張參考圖（1024² 佔 4096 個 VAE token + 1024 個 ViT
+    token），模型是看著圖寫 recaption，寫出來的是「改完之後的圖長什麼樣」，
+    不是把使用者那句短指令重複一遍。所以這裡也要照做——序列變長六倍，
+    rope 要帶 2D 段落，遮罩要讓參考圖那一塊全連通，embedding 要自己蓋。
     """
     from hymlx.rope import build_batch_2d_rope, build_attention_mask
     tk = cond._tokenizer
-    toks = list(cond.build_text(prompt, system_prompt=sys_prompt, bot_task="think")[0][0])
+    tc = cond.build_text(prompt, system_prompt=sys_prompt, bot_task="think",
+                         image=image, with_cond=True)
+    toks = list(tc.tokens[0])
     plen = len(toks)
     rng = np.random.RandomState(seed)
     caches = m.new_caches()
     D = m.head_dim
     S = len(toks)
-    cos, sin = build_batch_2d_rope(S, D, image_infos=[None], base=m.rope_theta)
-    am = mx.where(build_attention_mask(S), mx.array(0.0, mx.float32),
-                  mx.array(-3.4028235e38, mx.float32))
-    t0 = time.time()
-    lg = m.logits(mx.array(np.array(toks, dtype=np.int32)[None]), cos, sin, am, caches)
+    info = tc.rope_image_info[0] if image is not None else None
     MAXPOS = S + max_new + 8
-    cos_all, sin_all = build_batch_2d_rope(MAXPOS, D, image_infos=[None], base=m.rope_theta)
+    # 前綴的位置是整段的前綴（rope_positions 對圖像段之後的文字接著往下排），
+    # 所以一次建到 MAXPOS，前綴直接切片就好。
+    cos_all, sin_all = build_batch_2d_rope(MAXPOS, D, image_infos=[info], base=m.rope_theta)
+    cos, sin = cos_all[:, :S], sin_all[:, :S]
+    am = mx.where(build_attention_mask(S, tc.full_attn_slices[0]),
+                  mx.array(0.0, mx.float32), mx.array(-3.4028235e38, mx.float32))
+    t0 = time.time()
+    if image is None:
+        lg = m.logits(mx.array(np.array(toks, dtype=np.int32)[None]), cos, sin, am, caches)
+    else:
+        h = m.embed_prefix(mx.array(tc.tokens.astype(np.int32)), tc.cond)
+        mx.eval(h)
+        m._vision = m._aligner = m._encoder = None      # 特徵已快取，卸掉編碼器
+        mx.clear_cache()
+        lg = m.logits(None, cos, sin, am, caches, embeds=h)
+        del h
+    del am
+    mx.clear_cache()
 
     def sample(logits):
         v = np.array(logits.astype(mx.float32), copy=False)[0] / max(temperature, 1e-6)
@@ -61,7 +82,11 @@ def generate_cot(m, cond, prompt, sys_prompt, max_new=1100, temperature=0.6,
             break
         nxt = sample(lg)
     cot = tk.think_token + tk.decode(toks[plen:])
-    log(f"    CoT {len(toks)-plen} token，{time.time()-t0:.0f}s")
+    n = len(toks) - plen
+    # 撞到上限代表 recaption 是被切斷的（可能斷在字中間），影像階段吃到的
+    # 就是半句話。官方的 max_new_tokens 是 2048，我一開始寫 1100 就踩到過。
+    trunc = "（**撞到上限，被切斷**）" if n >= max_new else ""
+    log(f"    CoT {n} token，{time.time()-t0:.0f}s{trunc}")
     del caches
     mx.clear_cache()
     return cot
@@ -190,13 +215,10 @@ def main() -> int:
         t_sub = time.time()
         if a.cot_file:
             cot = Path(a.cot_file).read_text()
-        elif a.image:
-            # 編輯先不走 CoT：文字階段的序列本身也含參考圖，要另外接
-            cot = None
         elif a.no_cot:
             cot = None
         else:
-            cot = generate_cot(m, cond, prompt, sp, seed=a.seed)
+            cot = generate_cot(m, cond, prompt, sp, seed=a.seed, image=a.image)
         if cot:
             (outdir / f"{name}_cot.txt").write_text(cot)
         render(m, cond, dec, vc, prompt, cot, sp, a.size, a.steps, a.guidance,
